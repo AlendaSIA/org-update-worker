@@ -1,6 +1,3 @@
-cd ~/org-update-worker
-
-cat > main.py <<'PY'
 import base64
 import json
 import os
@@ -11,6 +8,7 @@ app = FastAPI()
 
 PAYTRAQ_BASE = "https://go.paytraq.com"
 
+
 @app.get("/health")
 def health():
     return {"ok": True}
@@ -19,7 +17,7 @@ def health():
 def get_paytraq_auth():
     return {
         "APIKey": os.environ.get("PAYTRAQ_API_KEY"),
-        "APIToken": os.environ.get("PAYTRAQ_API_TOKEN")
+        "APIToken": os.environ.get("PAYTRAQ_API_TOKEN"),
     }
 
 
@@ -51,7 +49,7 @@ async def pubsub_handler(request: Request):
     xml = fetch_sale(document_id)
 
     if "<ClientID>" in xml:
-        start = xml.find("<ClientID>") + 10
+        start = xml.find("<ClientID>") + len("<ClientID>")
         end = xml.find("</ClientID>")
         client_id = xml[start:end]
     else:
@@ -62,6 +60,5 @@ async def pubsub_handler(request: Request):
     return {
         "ok": True,
         "document_id": document_id,
-        "client_id": client_id
+        "client_id": client_id,
     }
-PY
