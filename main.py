@@ -2,16 +2,20 @@ import os
 import base64
 import json
 from datetime import date, timedelta
+from typing import Any, Dict, List, Optional
 from xml.etree import ElementTree as ET
 
 import requests
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-PAYTRAQ_BASE_URL = os.getenv("PAYTRAQ_BASE_URL", "https://go.paytraq.com")
+# ----------------------------
+# ENV
+# ----------------------------
+PAYTRAQ_BASE_URL = os.getenv("PAYTRAQ_BASE_URL", "https://go.paytraq.com").rstrip("/")
 PAYTRAQ_API_KEY = os.getenv("PAYTRAQ_API_KEY")
 PAYTRAQ_API_TOKEN = os.getenv("PAYTRAQ_API_TOKEN")
-PIPEDRIVE_API_TOKEN = os.getenv("PIPEDRIVE_API_TOKEN")  # vēl nelietojam šajā solī
+PIPEDRIVE_API_TOKEN = os.getenv("PIPEDRIVE_API_TOKEN")  # šajā solī vēl nelietojam
 
 app = FastAPI()
 
@@ -38,16 +42,38 @@ def _require_env():
         raise RuntimeError("Missing env vars: " + ", ".join(missing))
 
 
-def _decode_pubsub_push(body: dict) -> dict:
-    msg = (body or {}).get("message") or {}
+def _safe_b64decode(s: str) -> bytes:
+    # Pub/Sub dažreiz atnāk bez padding (=)
+    s = (s or "").strip()
+    pad = (-len(s)) % 4
+    if pad:
+        s = s + ("=" * pad)
+    return base64.b64decode(s)
+
+
+def _decode_pubsub_push(body: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Pieņem:
+    1) Pub/Sub push formātu: {"message":{"data":"base64(json)"}, ...}
+    2) Tiešu JSON payload testam: {"deal_id":..,"document_id":..}
+    """
+    if not isinstance(body, dict):
+        return {}
+
+    # Ja jau ir payload lauki — pieņemam kā tiešo payload
+    if any(k in body for k in ("document_id", "deal_id", "client_id", "date_from", "date_till")):
+        return body
+
+    msg = (body.get("message") or {}) if isinstance(body.get("message"), dict) else {}
     data_b64 = msg.get("data")
     if not data_b64:
         return {}
-    raw = base64.b64decode(data_b64).decode("utf-8", errors="replace")
+
+    raw = _safe_b64decode(str(data_b64)).decode("utf-8", errors="replace")
     return json.loads(raw)
 
 
-def fetch_client_id_from_sale(document_id: str) -> str | None:
+def fetch_client_id_from_sale(document_id: str) -> Optional[str]:
     _require_env()
     url = f"{PAYTRAQ_BASE_URL}/api/sale/{document_id}"
     params = {"APIKey": PAYTRAQ_API_KEY, "APIToken": PAYTRAQ_API_TOKEN}
@@ -80,12 +106,17 @@ def fetch_client_id_from_sale(document_id: str) -> str | None:
     return None
 
 
-def list_sales_client_range(client_id: str, d_from: date, d_to: date):
+def list_sales_client_range(client_id: str, d_from: date, d_to: date) -> List[ET.Element]:
+    """
+    SVARĪGI:
+    - PayTraq paging tavos strādājošajos skriptos sākas ar page=0, nevis 1.
+    - Tāpēc šeit page=0 (tas bija galvenais bug).
+    """
     _require_env()
 
     url = f"{PAYTRAQ_BASE_URL}/api/sales"
-    page = 1
-    out = []
+    page = 0  # <<< FIX: bija 1
+    out: List[ET.Element] = []
 
     print(f"PAYTRAQ /api/sales RANGE client_id={client_id} date_from={d_from.isoformat()} date_till={d_to.isoformat()}")
 
@@ -117,7 +148,10 @@ def list_sales_client_range(client_id: str, d_from: date, d_to: date):
 
         out.extend(sales)
 
-        if len(sales) < 100:
+        # PayTraq lapas izmērs nav dokumentēts šeit; tavos skriptos pietika ar "kamēr vēl ir Sale".
+        # Drošības bremze: ja kādreiz iestrēgst, pārtraucam pēc 200 lapām.
+        if page >= 200:
+            print("WARN: paging safety stop at page=200")
             break
 
         page += 1
@@ -126,27 +160,58 @@ def list_sales_client_range(client_id: str, d_from: date, d_to: date):
     return out
 
 
-def compute_total_365d(sales_items) -> float:
+def _parse_float(text: Optional[str]) -> Optional[float]:
+    if not text:
+        return None
+    try:
+        return float(text.strip().replace(",", "."))
+    except Exception:
+        return None
+
+
+def compute_total_365d(sales_items: List[ET.Element], only_ale: bool = True) -> float:
     total = 0.0
     for sale in sales_items:
         try:
-            node = sale.find(".//Header/Total") or sale.find(".//Total")
-            if node is None or not node.text:
+            # filtrs: tikai ALE, ja vajag
+            if only_ale:
+                ref = (sale.findtext(".//Header/Document/DocumentRef") or sale.findtext(".//DocumentRef") or "").strip()
+                if ref and not ref.startswith("ALE"):
+                    continue
+
+            # Total var būt dažādos ceļos atkarībā no PayTraq XML
+            candidates = [
+                sale.findtext(".//Header/Total"),
+                sale.findtext(".//Header/Document/Total"),
+                sale.findtext(".//Total"),
+            ]
+            val = None
+            for c in candidates:
+                val = _parse_float(c)
+                if val is not None:
+                    break
+            if val is None:
                 continue
-            total += float(node.text.strip().replace(",", "."))
+
+            total += val
         except Exception:
             pass
     return round(total, 2)
 
 
-def extract_refs(sales_items, limit: int = 50):
-    out = []
+def extract_refs(sales_items: List[ET.Element], limit: int = 50, only_ale: bool = True) -> List[str]:
+    out: List[str] = []
     for sale in sales_items:
-        doc = sale.find(".//Header/Document")
+        doc = sale.find(".//Header/Document") or sale.find(".//Document")
         if doc is None:
             continue
+
         d = (doc.findtext("DocumentDate") or "").strip()
         ref = (doc.findtext("DocumentRef") or "").strip()
+
+        if only_ale and ref and not ref.startswith("ALE"):
+            continue
+
         if d or ref:
             out.append(f"{d} | {ref}")
         if len(out) >= limit:
@@ -166,14 +231,14 @@ async def handle_pubsub(request: Request):
         return JSONResponse({"ok": False, "error": "decode_failed"}, status_code=400)
 
     if not payload:
-        print("WARN: no message.data; body=", body)
+        print("WARN: no payload; body=", body)
         return {"ok": True, "skipped": "no_data"}
 
     deal_id = payload.get("deal_id")
     document_id = payload.get("document_id")
     client_id = payload.get("client_id")
 
-    # optional override from payload for testing:
+    # optional override for testing:
     date_from_s = payload.get("date_from")  # "YYYY-MM-DD"
     date_till_s = payload.get("date_till")  # "YYYY-MM-DD"
 
@@ -193,24 +258,24 @@ async def handle_pubsub(request: Request):
     if not client_id:
         return {"ok": True, "skipped": "no_client_id", "payload": payload, "document_id": document_id}
 
-    # default: 450 days (to avoid timezone edge + give buffer)
+    # default: 450 days (buffer)
     d_to = date.today()
     d_from = d_to - timedelta(days=450)
 
     if date_from_s and date_till_s:
         try:
-            y, m, d = [int(x) for x in date_from_s.split("-")]
+            y, m, d = [int(x) for x in str(date_from_s).split("-")]
             d_from = date(y, m, d)
-            y, m, d = [int(x) for x in date_till_s.split("-")]
+            y, m, d = [int(x) for x in str(date_till_s).split("-")]
             d_to = date(y, m, d)
         except Exception:
             print("WARN: bad date_from/date_till in payload; using default 450d")
 
     try:
         sales = list_sales_client_range(str(client_id), d_from, d_to)
-        total_365d = compute_total_365d(sales)
-        refs = extract_refs(sales, limit=20)
-        print(f"ORG-UPDATE total_sum client_id={client_id}: {total_365d}")
+        total_sum = compute_total_365d(sales, only_ale=True)
+        refs = extract_refs(sales, limit=20, only_ale=True)
+        print(f"ORG-UPDATE total_sum client_id={client_id}: {total_sum}")
     except Exception as e:
         print("PAYTRAQ error:", str(e))
         return JSONResponse({"ok": False, "error": "paytraq_failed", "detail": str(e)}, status_code=500)
@@ -223,6 +288,6 @@ async def handle_pubsub(request: Request):
         "date_from": d_from.isoformat(),
         "date_till": d_to.isoformat(),
         "sales_count": len(sales),
-        "total_sum": total_365d,
+        "total_sum": total_sum,
         "sample_refs": refs,
     }
