@@ -1,9 +1,9 @@
-import os, base64, json, time
+import os, base64, json, time, importlib
 from datetime import date, timedelta
-from typing import Any, Dict
+from typing import Any, Dict, List
+from xml.etree import ElementTree as ET
 
 import requests
-from xml.etree import ElementTree as ET
 
 PAYTRAQ_BASE_URL = os.getenv("PAYTRAQ_BASE_URL", "https://go.paytraq.com").rstrip("/")
 PAYTRAQ_API_KEY = os.getenv("PAYTRAQ_API_KEY")
@@ -17,7 +17,7 @@ def health():
             "PAYTRAQ_BASE_URL": PAYTRAQ_BASE_URL,
             "PAYTRAQ_API_KEY_set": bool(PAYTRAQ_API_KEY),
             "PAYTRAQ_API_TOKEN_set": bool(PAYTRAQ_API_TOKEN),
-            "PIPEDRIVE_API_TOKEN_set": bool(PIPEDRIVE_API_TOKEN),
+            "PIPEDRIVE_API_TOKEN_set": bool(PIPEDRIVE_API_API_TOKEN),
         },
     }
 
@@ -128,15 +128,23 @@ def _run_step(ctx, name, fn):
         ctx["_trace"].append({"step": name, "ok": False, "ms": int((time.time()-t0)*1000), "error": str(e)})
         raise
 
-def run(body: Dict[str, Any]):
-    from steps import step_01_parse_event, step_02_fetch_client_id, step_03_compute_12m, step_04_build_update
+def _discover_steps() -> List[str]:
+    # manually list to keep it simple and predictable
+    # later we can auto-discover via pkgutil if you want
+    return [
+        "steps.step_01_parse_event",
+        "steps.step_02_fetch_client_id",
+        "steps.step_03_compute_12m",
+        "steps.step_04_build_update",
+        "steps.step_05_update_org",
+    ]
 
+def run(body: Dict[str, Any]):
     ctx = {
         "body": body,
         "_trace": [],
         "log": print,
 
-        # canonical helpers
         "decode_event_to_payload": decode_event_to_payload,
         "fetch_client_id_from_sale": fetch_client_id_from_sale,
         "list_sales_client_range": list_sales_client_range,
@@ -145,17 +153,15 @@ def run(body: Dict[str, Any]):
         "today": date.today,
         "timedelta": timedelta,
 
-        # aliases (lai sader ar esošajiem step failiem)
         "decode_pubsub": decode_event_to_payload,
         "paytraq_fetch_client_id": fetch_client_id_from_sale,
         "paytraq_list_sales": list_sales_client_range,
         "compute_total": compute_total_12m,
     }
 
-    _run_step(ctx, "01_parse_event", step_01_parse_event.run)
-    _run_step(ctx, "02_fetch_client_id", step_02_fetch_client_id.run)
-    _run_step(ctx, "03_compute_12m", step_03_compute_12m.run)
-    _run_step(ctx, "04_build_update", step_04_build_update.run)
+    for modname in _discover_steps():
+        mod = importlib.import_module(modname)
+        _run_step(ctx, modname.split(".")[-1], mod.run)
 
     if ctx.get("skipped"):
         return {"ok": True, "skipped": ctx["skipped"], "_trace": ctx["_trace"], "payload": ctx.get("payload")}
@@ -174,5 +180,6 @@ def run(body: Dict[str, Any]):
         "total_sum": ctx.get("total_sum"),
         "sample_refs": ctx.get("sample_refs"),
         "update": ctx.get("update"),
+        "step_05": ctx.get("step_05"),
         "dry_run": bool(ctx.get("dry_run")),
     }
