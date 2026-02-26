@@ -16,7 +16,7 @@ from fastapi.responses import JSONResponse
 PAYTRAQ_BASE_URL = os.getenv("PAYTRAQ_BASE_URL", "https://go.paytraq.com").rstrip("/")
 PAYTRAQ_API_KEY = os.getenv("PAYTRAQ_API_KEY")
 PAYTRAQ_API_TOKEN = os.getenv("PAYTRAQ_API_TOKEN")
-PIPEDRIVE_API_TOKEN = os.getenv("PIPEDRIVE_API_TOKEN")  # vēl nelietojam šajā solī
+PIPEDRIVE_API_TOKEN = os.getenv("PIPEDRIVE_API_TOKEN")  # vēl nelietojam šajā versijā
 
 app = FastAPI()
 
@@ -34,6 +34,9 @@ async def health():
     }
 
 
+# ----------------------------
+# UTILS
+# ----------------------------
 def _require_env():
     missing = [k for k, v in {
         "PAYTRAQ_API_KEY": PAYTRAQ_API_KEY,
@@ -51,7 +54,7 @@ def _safe_b64decode(s: str) -> bytes:
     return base64.b64decode(s)
 
 
-def _decode_pubsub_push(body: Dict[str, Any]) -> Dict[str, Any]:
+def decode_event_to_payload(body: Dict[str, Any]) -> Dict[str, Any]:
     """
     Pieņem:
     1) Pub/Sub push: {"message":{"data":"base64(json)"}, ...}
@@ -60,9 +63,11 @@ def _decode_pubsub_push(body: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(body, dict):
         return {}
 
+    # direct test JSON
     if any(k in body for k in ("document_id", "deal_id", "client_id", "org_id", "date_from", "date_till", "dry_run")):
         return body
 
+    # pubsub push
     msg = (body.get("message") or {}) if isinstance(body.get("message"), dict) else {}
     data_b64 = msg.get("data")
     if not data_b64:
@@ -72,6 +77,18 @@ def _decode_pubsub_push(body: Dict[str, Any]) -> Dict[str, Any]:
     return json.loads(raw)
 
 
+def _parse_float(text: Optional[str]) -> Optional[float]:
+    if not text:
+        return None
+    try:
+        return float(text.strip().replace(",", "."))
+    except Exception:
+        return None
+
+
+# ----------------------------
+# PAYTRAQ
+# ----------------------------
 def fetch_client_id_from_sale(document_id: str) -> Optional[str]:
     _require_env()
     url = f"{PAYTRAQ_BASE_URL}/api/sale/{document_id}"
@@ -89,16 +106,13 @@ def fetch_client_id_from_sale(document_id: str) -> Optional[str]:
 
     node = root.find(".//Client/ClientID")
     if node is not None and node.text and node.text.strip():
-        cid = node.text.strip()
-        print(f"PAYTRAQ sale -> ClientID via .//Client/ClientID = {cid}")
-        return cid
+        return node.text.strip()
 
+    # fallback
     for el in root.iter():
         tag = (str(el.tag) or "").lower()
         if tag.endswith("clientid") and el.text and el.text.strip():
-            cid = el.text.strip()
-            print(f"PAYTRAQ sale -> ClientID via iter(*ClientID) = {cid}")
-            return cid
+            return el.text.strip()
 
     print("PAYTRAQ sale -> ClientID NOT found. XML head(first1200):")
     print(r.text[:1200])
@@ -130,7 +144,6 @@ def list_sales_client_range(client_id: str, d_from: date, d_to: date) -> List[ET
         r = requests.get(url, params=params, timeout=30)
         ct = (r.headers.get("content-type") or "").lower()
         print(f"PAYTRAQ /api/sales -> status={r.status_code} ct={ct} len={len(r.text)} page={page}")
-        print("PAYTRAQ sales xml head(first200):", r.text[:200])
 
         if r.status_code != 200:
             print("PAYTRAQ sales body(first500):", r.text[:500])
@@ -154,16 +167,7 @@ def list_sales_client_range(client_id: str, d_from: date, d_to: date) -> List[ET
     return out
 
 
-def _parse_float(text: Optional[str]) -> Optional[float]:
-    if not text:
-        return None
-    try:
-        return float(text.strip().replace(",", "."))
-    except Exception:
-        return None
-
-
-def compute_total_365d(sales_items: List[ET.Element], only_ale: bool = True) -> float:
+def compute_total_12m(sales_items: List[ET.Element], only_ale: bool = True) -> float:
     total = 0.0
     for sale in sales_items:
         try:
@@ -191,7 +195,7 @@ def compute_total_365d(sales_items: List[ET.Element], only_ale: bool = True) -> 
     return round(total, 2)
 
 
-def extract_refs(sales_items: List[ET.Element], limit: int = 50, only_ale: bool = True) -> List[str]:
+def extract_refs(sales_items: List[ET.Element], limit: int = 20, only_ale: bool = True) -> List[str]:
     out: List[str] = []
     for sale in sales_items:
         doc = sale.find(".//Header/Document") or sale.find(".//Document")
@@ -226,35 +230,35 @@ def _run_step(ctx: Dict[str, Any], name: str, fn):
         raise
 
 
-def step_01_parse_event(ctx: Dict[str, Any]):
-    body = ctx["body"]
-    payload = _decode_pubsub_push(body)
+# ----------------------------
+# STEPS (tagad vienā failā; vēlāk var 1:1 iznest atsevišķos failos)
+# ----------------------------
+def step_01_parse_event(ctx: Dict[str, Any]) -> None:
+    payload = decode_event_to_payload(ctx["body"])
     ctx["payload"] = payload
 
     if not payload:
         ctx["skipped"] = "no_data"
         return
 
-    ctx["deal_id"] = payload.get("deal_id")
-    ctx["org_id"] = payload.get("org_id")
-    ctx["document_id"] = payload.get("document_id")
-    ctx["client_id"] = payload.get("client_id")
+    # ids
+    ctx["deal_id"] = payload.get("deal_id", 0)
+    ctx["org_id"] = payload.get("org_id", 0)
+    ctx["document_id"] = payload.get("document_id", 0)
+    ctx["client_id"] = payload.get("client_id")  # var būt None
     ctx["dry_run"] = bool(payload.get("dry_run", False))
 
-    date_from_s = payload.get("date_from")
-    date_till_s = payload.get("date_till")
-
+    # dates
     d_to = date.today()
-    d_from = d_to - timedelta(days=450)
-
-    if date_from_s and date_till_s:
+    d_from = d_to - timedelta(days=365)
+    if payload.get("date_from") and payload.get("date_till"):
         try:
-            y, m, d = [int(x) for x in str(date_from_s).split("-")]
+            y, m, d = [int(x) for x in str(payload["date_from"]).split("-")]
             d_from = date(y, m, d)
-            y, m, d = [int(x) for x in str(date_till_s).split("-")]
+            y, m, d = [int(x) for x in str(payload["date_till"]).split("-")]
             d_to = date(y, m, d)
         except Exception:
-            print("WARN: bad date_from/date_till; using default 450d")
+            print("WARN: bad date_from/date_till; using default 365d")
 
     ctx["date_from"] = d_from
     ctx["date_till"] = d_to
@@ -263,30 +267,38 @@ def step_01_parse_event(ctx: Dict[str, Any]):
     print(f"ORG-UPDATE ids: deal_id={ctx['deal_id']} document_id={ctx['document_id']} client_id={ctx['client_id']} org_id={ctx['org_id']}")
 
 
-def step_02_fetch_client_id(ctx: Dict[str, Any]):
+def step_02_fetch_client_id(ctx: Dict[str, Any]) -> None:
     if ctx.get("skipped"):
         return
 
-    if not ctx.get("client_id") and ctx.get("document_id"):
-        ctx["client_id"] = fetch_client_id_from_sale(str(ctx["document_id"]))
+    # Ja client_id jau atnāca no worker/pubsub -> neko nedaram
+    if ctx.get("client_id"):
+        return
 
+    doc_id = ctx.get("document_id")
+    if not doc_id:
+        ctx["skipped"] = "no_document_id"
+        return
+
+    ctx["client_id"] = fetch_client_id_from_sale(str(doc_id))
     if not ctx.get("client_id"):
         ctx["skipped"] = "no_client_id"
 
 
-def step_03_compute_12m(ctx: Dict[str, Any]):
+def step_03_compute_12m(ctx: Dict[str, Any]) -> None:
     if ctx.get("skipped"):
         return
 
     sales = list_sales_client_range(str(ctx["client_id"]), ctx["date_from"], ctx["date_till"])
     ctx["sales_count"] = len(sales)
-    ctx["total_sum"] = compute_total_365d(sales, only_ale=True)
+    ctx["total_sum"] = compute_total_12m(sales, only_ale=True)
     ctx["sample_refs"] = extract_refs(sales, limit=20, only_ale=True)
 
-    print(f"ORG-UPDATE total_sum client_id={ctx['client_id']}: {ctx['total_sum']}")
+    print(f"ORG-UPDATE computed: client_id={ctx['client_id']} total_sum={ctx['total_sum']} sales_count={ctx['sales_count']}")
 
 
-def run_steps(ctx: Dict[str, Any]):
+def run_steps(ctx: Dict[str, Any]) -> None:
+    # Te ir “step modelis”. Pievienojot nākamo soli, pieliec vēl vienu _run_step rindu.
     _run_step(ctx, "01_parse_event", step_01_parse_event)
     _run_step(ctx, "02_fetch_client_id", step_02_fetch_client_id)
     _run_step(ctx, "03_compute_12m", step_03_compute_12m)
@@ -295,7 +307,6 @@ def run_steps(ctx: Dict[str, Any]):
 @app.post("/")
 async def handle_pubsub(request: Request):
     body = await request.json()
-
     ctx: Dict[str, Any] = {"body": body, "_trace": []}
 
     try:
@@ -319,6 +330,8 @@ async def handle_pubsub(request: Request):
             "_trace": ctx["_trace"],
             "payload": ctx.get("payload"),
             "document_id": ctx.get("document_id"),
+            "deal_id": ctx.get("deal_id"),
+            "org_id": ctx.get("org_id"),
         }
 
     return {
