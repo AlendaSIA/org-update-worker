@@ -48,10 +48,6 @@ def _decode_pubsub_push(body: dict) -> dict:
 
 
 def fetch_client_id_from_sale(document_id: str) -> str | None:
-    """
-    Ņem client_id no PayTraq sale/{document_id}
-    XML piem.: <Client><ClientID>864973</ClientID>...
-    """
     _require_env()
     url = f"{PAYTRAQ_BASE_URL}/api/sale/{document_id}"
     params = {"APIKey": PAYTRAQ_API_KEY, "APIToken": PAYTRAQ_API_TOKEN}
@@ -84,17 +80,14 @@ def fetch_client_id_from_sale(document_id: str) -> str | None:
     return None
 
 
-def list_sales_client_365d(client_id: str):
-    """
-    STABILS variants: parse ar .//Sale (nevis list(root))
-    """
+def list_sales_client_range(client_id: str, d_from: date, d_to: date):
     _require_env()
-    d_to = date.today()
-    d_from = d_to - timedelta(days=365)
 
     url = f"{PAYTRAQ_BASE_URL}/api/sales"
     page = 1
     out = []
+
+    print(f"PAYTRAQ /api/sales RANGE client_id={client_id} date_from={d_from.isoformat()} date_till={d_to.isoformat()}")
 
     while True:
         params = {
@@ -109,14 +102,13 @@ def list_sales_client_365d(client_id: str):
         r = requests.get(url, params=params, timeout=30)
         ct = (r.headers.get("content-type") or "").lower()
         print(f"PAYTRAQ /api/sales -> status={r.status_code} ct={ct} len={len(r.text)} page={page}")
-        print("PAYTRAQ sales xml head(first400):", r.text[:400])
+        print("PAYTRAQ sales xml head(first200):", r.text[:200])
 
         if r.status_code != 200:
             print("PAYTRAQ sales body(first500):", r.text[:500])
             r.raise_for_status()
 
         root = ET.fromstring(r.text)
-
         sales = root.findall(".//Sale")
         print(f"PAYTRAQ /api/sales -> found Sale nodes: {len(sales)} on page={page}")
 
@@ -181,6 +173,10 @@ async def handle_pubsub(request: Request):
     document_id = payload.get("document_id")
     client_id = payload.get("client_id")
 
+    # optional override from payload for testing:
+    date_from_s = payload.get("date_from")  # "YYYY-MM-DD"
+    date_till_s = payload.get("date_till")  # "YYYY-MM-DD"
+
     print("ORG-UPDATE payload:", payload)
     print(f"ORG-UPDATE ids: deal_id={deal_id} document_id={document_id} client_id={client_id}")
 
@@ -197,11 +193,24 @@ async def handle_pubsub(request: Request):
     if not client_id:
         return {"ok": True, "skipped": "no_client_id", "payload": payload, "document_id": document_id}
 
+    # default: 450 days (to avoid timezone edge + give buffer)
+    d_to = date.today()
+    d_from = d_to - timedelta(days=450)
+
+    if date_from_s and date_till_s:
+        try:
+            y, m, d = [int(x) for x in date_from_s.split("-")]
+            d_from = date(y, m, d)
+            y, m, d = [int(x) for x in date_till_s.split("-")]
+            d_to = date(y, m, d)
+        except Exception:
+            print("WARN: bad date_from/date_till in payload; using default 450d")
+
     try:
-        sales = list_sales_client_365d(str(client_id))
+        sales = list_sales_client_range(str(client_id), d_from, d_to)
         total_365d = compute_total_365d(sales)
         refs = extract_refs(sales, limit=20)
-        print(f"ORG-UPDATE total_365d client_id={client_id}: {total_365d}")
+        print(f"ORG-UPDATE total_sum client_id={client_id}: {total_365d}")
     except Exception as e:
         print("PAYTRAQ error:", str(e))
         return JSONResponse({"ok": False, "error": "paytraq_failed", "detail": str(e)}, status_code=500)
@@ -211,7 +220,9 @@ async def handle_pubsub(request: Request):
         "client_id": str(client_id),
         "document_id": document_id,
         "deal_id": deal_id,
+        "date_from": d_from.isoformat(),
+        "date_till": d_to.isoformat(),
         "sales_count": len(sales),
-        "total_365d": total_365d,
+        "total_sum": total_365d,
         "sample_refs": refs,
     }
