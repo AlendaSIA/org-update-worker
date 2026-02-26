@@ -129,7 +129,7 @@ def _run_step(ctx, name, fn):
         raise
 
 def run(body: Dict[str, Any]):
-    from steps import step_01_parse_event, step_02_fetch_client_id, step_03_compute_12m
+    from steps import step_01_parse_event, step_02_fetch_client_id, step_03_compute_12m, step_04_build_update
 
     ctx = {
         "body": body,
@@ -145,7 +145,7 @@ def run(body: Dict[str, Any]):
         "today": date.today,
         "timedelta": timedelta,
 
-        # aliases for your existing step files (so they work)
+        # aliases (lai sader ar esošajiem step failiem)
         "decode_pubsub": decode_event_to_payload,
         "paytraq_fetch_client_id": fetch_client_id_from_sale,
         "paytraq_list_sales": list_sales_client_range,
@@ -155,6 +155,7 @@ def run(body: Dict[str, Any]):
     _run_step(ctx, "01_parse_event", step_01_parse_event.run)
     _run_step(ctx, "02_fetch_client_id", step_02_fetch_client_id.run)
     _run_step(ctx, "03_compute_12m", step_03_compute_12m.run)
+    _run_step(ctx, "04_build_update", step_04_build_update.run)
 
     if ctx.get("skipped"):
         return {"ok": True, "skipped": ctx["skipped"], "_trace": ctx["_trace"], "payload": ctx.get("payload")}
@@ -172,4 +173,6 @@ def run(body: Dict[str, Any]):
         "sales_count": ctx.get("sales_count"),
         "total_sum": ctx.get("total_sum"),
         "sample_refs": ctx.get("sample_refs"),
+        "update": ctx.get("update"),
+        "dry_run": bool(ctx.get("dry_run")),
     }
