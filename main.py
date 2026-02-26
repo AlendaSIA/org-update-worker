@@ -2,7 +2,7 @@ import os
 import json
 import base64
 import traceback
-from datetime import datetime, timedelta, timezone, date
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional, List, Tuple
 
 import requests
@@ -10,49 +10,19 @@ import xml.etree.ElementTree as ET
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # APP
-# -----------------------------------------------------------------------------
+# =============================================================================
 app = FastAPI()
 
-# -----------------------------------------------------------------------------
-# CONFIG (env)
-# -----------------------------------------------------------------------------
-PAYTRAQ_BASE_URL = os.getenv("PAYTRAQ_BASE_URL", "https://go.paytraq.com")
-PAYTRAQ_API_KEY = os.getenv("PAYTRAQ_API_KEY") or os.getenv("API_KEY")
-PAYTRAQ_API_TOKEN = os.getenv("PAYTRAQ_API_TOKEN") or os.getenv("API_TOKEN")
-
-PIPEDRIVE_BASE_URL = os.getenv("PIPEDRIVE_BASE_URL", "https://api.pipedrive.com/v1")
-PIPEDRIVE_API_TOKEN = os.getenv("PIPEDRIVE_API_TOKEN")
-
-HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "30"))
-
-# Pipedrive custom field keys (from your saved mapping)
-PD_ORG_EMAIL_KEY = "faac2c792221bf18216ef17eae1941feef9a17cc"
-PD_ORG_COUNTRY_KEY = "0905a8eedcb78f85063132a4aa37b76c0fc7da1d"
-PD_ORG_REGNO_KEY = "259f90917e748590024b17a61fa5014a685fc3e6"
-PD_ORG_VAT_KEY = "abf60c765911b83a0e0243483c2bf3ee680f6b0c"
-PD_ORG_SHIPADDR_KEY = "dae3df0edeadce95ba223719cc18141795387de8"
-PD_ORG_PHONE_KEY = "4b4db855bb2ac128d585e2d84c554eb099e588f7"
-PD_ORG_API_UPDATED_KEY = "aefa60a6cdc10e98eb5235f9f2d5a7bf421c1cdb"
-PD_ORG_12M_SUM_KEY = "0b79b8878b6eebe6ab289a60a34cd7340b28899b"
-
-# Example PG fields (you can expand later)
-PD_PG_NITRILE_SUM_KEY = "4abca39441adff414bbc87e0853ef15c42784c14"
-PD_PG_NITRILE_DATE_KEY = "5160be434e5c47525f5ffba46a2e0eef63de6c59"
-
-# Optional: define nitrile detection by SKU/keywords (tweak anytime via env)
-NITRILE_SKUS = [s.strip() for s in (os.getenv("NITRILE_SKUS", "")).split(",") if s.strip()]
-NITRILE_KEYWORDS = [s.strip().lower() for s in (os.getenv("NITRILE_KEYWORDS", "nitril,nitrile").split(",")) if s.strip()]
-
-# -----------------------------------------------------------------------------
+# =============================================================================
 # LOG HELPERS
-# -----------------------------------------------------------------------------
+# =============================================================================
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 def log(title: str, obj: Any = None) -> None:
-    print("\n" + "=" * 90)
+    print("\n" + "=" * 100)
     print(title)
     if obj is not None:
         try:
@@ -62,9 +32,9 @@ def log(title: str, obj: Any = None) -> None:
                 print(str(obj))
         except Exception:
             print(repr(obj))
-    print("=" * 90 + "\n")
+    print("=" * 100 + "\n")
 
-def xml_preview(s: str, limit: int = 1500) -> str:
+def preview_text(s: str, limit: int = 1800) -> str:
     s = (s or "").strip()
     return s if len(s) <= limit else (s[:limit] + "\n...[TRUNCATED]...\n")
 
@@ -74,58 +44,81 @@ def safe_float(x: Any) -> float:
     except Exception:
         return 0.0
 
-def env_status() -> Dict[str, Any]:
-    return {
-        "PAYTRAQ_BASE_URL": PAYTRAQ_BASE_URL,
-        "PAYTRAQ_API_KEY_set": bool(PAYTRAQ_API_KEY),
-        "PAYTRAQ_API_TOKEN_set": bool(PAYTRAQ_API_TOKEN),
-        "PIPEDRIVE_BASE_URL": PIPEDRIVE_BASE_URL,
-        "PIPEDRIVE_API_TOKEN_set": bool(PIPEDRIVE_API_TOKEN),
-        "NITRILE_SKUS": NITRILE_SKUS,
-        "NITRILE_KEYWORDS": NITRILE_KEYWORDS,
-        "ts": now_iso(),
-    }
+# =============================================================================
+# STRICT ENV (ONLY SECRETS-ENV)
+# =============================================================================
+def require_env(name: str) -> str:
+    v = os.getenv(name)
+    print(f"[ENV] {name} set={bool(v)}")
+    if not v:
+        raise RuntimeError(f"Missing env var: {name}")
+    return v
 
-# -----------------------------------------------------------------------------
-# INPUT PARSING (Pub/Sub push)
-# -----------------------------------------------------------------------------
-def decode_pubsub_payload(body: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
+# Secrets injected by Cloud Run (--set-secrets)
+PAYTRAQ_API_KEY = require_env("PAYTRAQ_API_KEY")
+PAYTRAQ_API_TOKEN = require_env("PAYTRAQ_API_TOKEN")
+PIPEDRIVE_API_TOKEN = require_env("PIPEDRIVE_API_TOKEN")
+
+PAYTRAQ_BASE_URL = os.getenv("PAYTRAQ_BASE_URL", "https://go.paytraq.com")
+PIPEDRIVE_BASE_URL = os.getenv("PIPEDRIVE_BASE_URL", "https://api.pipedrive.com/v1")
+HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "30"))
+
+# =============================================================================
+# PIPEDRIVE FIELD KEYS (your saved mapping)
+# =============================================================================
+PD_ORG_EMAIL_KEY = "faac2c792221bf18216ef17eae1941feef9a17cc"
+PD_ORG_COUNTRY_KEY = "0905a8eedcb78f85063132a4aa37b76c0fc7da1d"
+PD_ORG_REGNO_KEY = "259f90917e748590024b17a61fa5014a685fc3e6"
+PD_ORG_VAT_KEY = "abf60c765911b83a0e0243483c2bf3ee680f6b0c"
+PD_ORG_SHIPADDR_KEY = "dae3df0edeadce95ba223719cc18141795387de8"
+PD_ORG_PHONE_KEY = "4b4db855bb2ac128d585e2d84c554eb099e588f7"
+PD_ORG_API_UPDATED_KEY = "aefa60a6cdc10e98eb5235f9f2d5a7bf421c1cdb"
+PD_ORG_12M_SUM_KEY = "0b79b8878b6eebe6ab289a60a34cd7340b28899b"
+
+# Optional PG example (we won’t block on this; leave for later refinement)
+PD_PG_NITRILE_SUM_KEY = "4abca39441adff414bbc87e0853ef15c42784c14"
+PD_PG_NITRILE_DATE_KEY = "5160be434e5c47525f5ffba46a2e0eef63de6c59"
+
+NITRILE_SKUS = [s.strip() for s in (os.getenv("NITRILE_SKUS", "")).split(",") if s.strip()]
+NITRILE_KEYWORDS = [s.strip().lower() for s in (os.getenv("NITRILE_KEYWORDS", "nitril,nitrile").split(",")) if s.strip()]
+
+# =============================================================================
+# INPUT (Pub/Sub push)
+# =============================================================================
+def decode_pubsub_message(body: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
     """
-    Expects: {"message":{"data":"base64(json)"}}.
-    Returns: (payload_dict_or_None, debug)
+    Expected: {"message": {"data": "base64(json)" } }
     """
-    debug: Dict[str, Any] = {"has_message": False, "has_data": False}
+    dbg: Dict[str, Any] = {"body_keys": list(body.keys()) if isinstance(body, dict) else None}
+
     if not isinstance(body, dict):
-        debug["reason"] = "body_not_dict"
-        return None, debug
+        dbg["reason"] = "body_not_dict"
+        return None, dbg
 
     msg = body.get("message")
     if not isinstance(msg, dict):
-        debug["reason"] = "no_message_dict"
-        return None, debug
-    debug["has_message"] = True
+        dbg["reason"] = "no_message"
+        return None, dbg
 
-    b64 = msg.get("data")
-    if not isinstance(b64, str) or not b64.strip():
-        debug["reason"] = "no_message_data"
-        return None, debug
-    debug["has_data"] = True
+    data = msg.get("data")
+    if not isinstance(data, str) or not data.strip():
+        dbg["reason"] = "no_message_data"
+        return None, dbg
 
     try:
-        raw = base64.b64decode(b64).decode("utf-8", errors="ignore")
-        debug["decoded_raw_preview"] = raw[:1000]
+        raw = base64.b64decode(data).decode("utf-8", errors="ignore")
+        dbg["decoded_preview"] = raw[:1000]
         payload = json.loads(raw)
-        return payload, debug
+        dbg["payload_keys"] = list(payload.keys()) if isinstance(payload, dict) else None
+        return payload, dbg
     except Exception as e:
-        debug["reason"] = "decode_failed"
-        debug["error"] = str(e)
-        debug["trace"] = traceback.format_exc()
-        return None, debug
+        dbg["reason"] = "decode_failed"
+        dbg["error"] = str(e)
+        dbg["trace"] = traceback.format_exc()
+        return None, dbg
 
 def extract_doc_and_deal(payload: Dict[str, Any]) -> Tuple[Optional[int], Optional[int], Dict[str, Any]]:
-    debug = {"payload_keys": list(payload.keys()) if isinstance(payload, dict) else None}
-    if not isinstance(payload, dict):
-        return None, None, debug
+    dbg = {"payload": payload}
 
     doc_id = None
     deal_id = None
@@ -134,29 +127,26 @@ def extract_doc_and_deal(payload: Dict[str, Any]) -> Tuple[Optional[int], Option
         if k in payload:
             try:
                 doc_id = int(payload[k])
-                debug["doc_id_from"] = k
+                dbg["doc_id_from"] = k
                 break
             except Exception:
-                debug["doc_id_bad_value"] = payload.get(k)
+                dbg["doc_id_bad"] = {k: payload.get(k)}
 
     for k in ["deal_id", "DealID", "dealId"]:
         if k in payload:
             try:
                 deal_id = int(payload[k])
-                debug["deal_id_from"] = k
+                dbg["deal_id_from"] = k
                 break
             except Exception:
-                debug["deal_id_bad_value"] = payload.get(k)
+                dbg["deal_id_bad"] = {k: payload.get(k)}
 
-    return doc_id, deal_id, debug
+    return doc_id, deal_id, dbg
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # PAYTRAQ
-# -----------------------------------------------------------------------------
+# =============================================================================
 def paytraq_get(path: str, params: Optional[Dict[str, Any]] = None) -> str:
-    if not PAYTRAQ_API_KEY or not PAYTRAQ_API_TOKEN:
-        raise RuntimeError("PAYTRAQ_API_KEY/PAYTRAQ_API_TOKEN nav uzlikti (Cloud Run secrets/env)!")
-
     url = f"{PAYTRAQ_BASE_URL.rstrip('/')}/api/{path.lstrip('/')}"
     qp = {"APIKey": PAYTRAQ_API_KEY, "APIToken": PAYTRAQ_API_TOKEN}
     if params:
@@ -164,7 +154,7 @@ def paytraq_get(path: str, params: Optional[Dict[str, Any]] = None) -> str:
 
     log("PAYTRAQ GET request", {"url": url, "params": qp})
     r = requests.get(url, params=qp, timeout=HTTP_TIMEOUT)
-    log("PAYTRAQ GET response", {"status": r.status_code, "body_preview": xml_preview(r.text)})
+    log("PAYTRAQ GET response", {"status": r.status_code, "body_preview": preview_text(r.text)})
     r.raise_for_status()
     return r.text
 
@@ -178,11 +168,10 @@ def find_text(root: ET.Element, xpath: str) -> Optional[str]:
     t = el.text.strip()
     return t if t else None
 
-def get_sale_xml(document_id: int) -> Tuple[ET.Element, Dict[str, Any]]:
+def get_sale_root_and_meta(document_id: int) -> Tuple[ET.Element, Dict[str, Any]]:
     xml_text = paytraq_get(f"sale/{document_id}")
     root = parse_xml(xml_text)
 
-    # Try extract meta (best effort)
     meta = {
         "DocumentID": str(document_id),
         "DocumentDate": find_text(root, "./Header/Document/DocumentDate"),
@@ -190,12 +179,12 @@ def get_sale_xml(document_id: int) -> Tuple[ET.Element, Dict[str, Any]]:
         "Total": find_text(root, "./Header/Total"),
         "IncludeTax": find_text(root, "./Header/IncludeTax"),
     }
-    log("SALE meta parsed (best effort)", meta)
+    log("SALE meta (best-effort)", meta)
     return root, meta
 
-def extract_client_id_from_sale(root: ET.Element) -> Tuple[Optional[int], Dict[str, Any]]:
+def extract_client_id_from_sale(sale_root: ET.Element) -> Tuple[Optional[int], Dict[str, Any]]:
     """
-    PayTraq XML sometimes differs. We try multiple paths + deep scan fallback.
+    Try several likely paths + fallback scan.
     """
     attempted = []
     paths = [
@@ -206,21 +195,20 @@ def extract_client_id_from_sale(root: ET.Element) -> Tuple[Optional[int], Dict[s
     ]
     for p in paths:
         attempted.append(p)
-        v = find_text(root, p)
+        v = find_text(sale_root, p)
         if v:
             try:
-                cid = int(v)
-                return cid, {"found": True, "path": p, "value": v, "attempted": attempted}
+                return int(v), {"found": True, "path": p, "value": v, "attempted": attempted}
             except Exception:
                 return None, {"found": False, "path": p, "bad_value": v, "attempted": attempted}
 
-    # fallback: search any element named ClientID anywhere
-    for el in root.iter():
-        if (el.tag or "").lower().endswith("clientid") and el.text and el.text.strip():
+    # deep scan
+    for el in sale_root.iter():
+        tag = (el.tag or "").lower()
+        if tag.endswith("clientid") and el.text and el.text.strip():
             t = el.text.strip()
             try:
-                cid = int(t)
-                return cid, {"found": True, "path": "iter(ClientID)", "value": t, "attempted": attempted}
+                return int(t), {"found": True, "path": "iter(ClientID)", "value": t, "attempted": attempted}
             except Exception:
                 return None, {"found": False, "path": "iter(ClientID)", "bad_value": t, "attempted": attempted}
 
@@ -247,6 +235,7 @@ def list_sales_365d(client_id: int) -> List[Dict[str, Any]]:
     till = datetime.now(timezone.utc).date()
     frm = (till - timedelta(days=365))
     params = {"ClientID": str(client_id), "date_from": frm.isoformat(), "date_till": till.isoformat()}
+
     xml_text = paytraq_get("sales", params=params)
     root = parse_xml(xml_text)
 
@@ -260,7 +249,7 @@ def list_sales_365d(client_id: int) -> List[Dict[str, Any]]:
             "IncludeTax": find_text(sale, "./Header/IncludeTax"),
         })
 
-    log("SALES(365d) parsed", {"count": len(rows), "sample_first_5": rows[:5]})
+    log("SALES 365d parsed", {"count": len(rows), "sample_first_5": rows[:5]})
     return rows
 
 def compute_12m_total(rows: List[Dict[str, Any]]) -> float:
@@ -275,7 +264,7 @@ def compute_12m_total(rows: List[Dict[str, Any]]) -> float:
 
 def detect_nitrile(sale_root: ET.Element) -> Tuple[bool, float, Dict[str, Any]]:
     """
-    SUPER best-effort. We will refine after we see real line item structure in logs.
+    Best-effort only (we will refine after we see real line items in logs).
     """
     matches = []
     sum_total = 0.0
@@ -301,13 +290,10 @@ def detect_nitrile(sale_root: ET.Element) -> Tuple[bool, float, Dict[str, Any]]:
     log("NITRILE detect debug", dbg)
     return (len(matches) > 0), round(sum_total, 2), dbg
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # PIPEDRIVE
-# -----------------------------------------------------------------------------
+# =============================================================================
 def pd_get(path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    if not PIPEDRIVE_API_TOKEN:
-        raise RuntimeError("PIPEDRIVE_API_TOKEN nav uzlikts (Cloud Run secrets/env)!")
-
     url = f"{PIPEDRIVE_BASE_URL.rstrip('/')}/{path.lstrip('/')}"
     qp = {"api_token": PIPEDRIVE_API_TOKEN}
     if params:
@@ -315,20 +301,17 @@ def pd_get(path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]
 
     log("PIPEDRIVE GET request", {"url": url, "params": qp})
     r = requests.get(url, params=qp, timeout=HTTP_TIMEOUT)
-    log("PIPEDRIVE GET response", {"status": r.status_code, "body_preview": r.text[:2000]})
+    log("PIPEDRIVE GET response", {"status": r.status_code, "body_preview": preview_text(r.text, 2200)})
     r.raise_for_status()
     return r.json()
 
 def pd_put(path: str, data: Dict[str, Any]) -> Dict[str, Any]:
-    if not PIPEDRIVE_API_TOKEN:
-        raise RuntimeError("PIPEDRIVE_API_TOKEN nav uzlikts (Cloud Run secrets/env)!")
-
     url = f"{PIPEDRIVE_BASE_URL.rstrip('/')}/{path.lstrip('/')}"
     qp = {"api_token": PIPEDRIVE_API_TOKEN}
 
     log("PIPEDRIVE PUT request", {"url": url, "params": qp, "data": data})
     r = requests.put(url, params=qp, json=data, timeout=HTTP_TIMEOUT)
-    log("PIPEDRIVE PUT response", {"status": r.status_code, "body_preview": r.text[:2500]})
+    log("PIPEDRIVE PUT response", {"status": r.status_code, "body_preview": preview_text(r.text, 2600)})
     r.raise_for_status()
     return r.json()
 
@@ -337,7 +320,7 @@ def pd_find_org_by_regno(regno: str) -> Optional[int]:
     if not term:
         return None
 
-    # Try organizations/search first
+    # 1) organizations/search
     try:
         js = pd_get("organizations/search", params={"term": term, "exact_match": 1})
         items = (((js or {}).get("data") or {}).get("items") or [])
@@ -348,7 +331,7 @@ def pd_find_org_by_regno(regno: str) -> Optional[int]:
     except Exception as e:
         log("organizations/search failed (regno) -> fallback", {"error": str(e)})
 
-    # Fallback organizations/find
+    # 2) organizations/find fallback
     try:
         js = pd_get("organizations/find", params={"term": term, "start": 0, "limit": 10})
         data = (js or {}).get("data") or []
@@ -414,25 +397,28 @@ def build_org_update_payload(
         payload[key] = v
         print(f"[SET] {label} -> {key} = {v}")
 
+    # Basic fields
     set_if(client.get("RegNumber"), PD_ORG_REGNO_KEY, "RegNumber")
     set_if(client.get("Email"), PD_ORG_EMAIL_KEY, "Email")
     set_if(client.get("VatNumber"), PD_ORG_VAT_KEY, "VatNumber")
     set_if(client.get("Phone"), PD_ORG_PHONE_KEY, "Phone")
     set_if(client.get("LegalAddress_Country"), PD_ORG_COUNTRY_KEY, "Country")
 
+    # Shipping address (from legal address as fallback)
     addr = client.get("LegalAddress_Address")
     zipc = client.get("LegalAddress_Zip")
     ctry = client.get("LegalAddress_Country")
     ship_full = " ".join([x for x in [addr, zipc, ctry] if x and str(x).strip()])
     set_if(ship_full, PD_ORG_SHIPADDR_KEY, "Shipping address (from LegalAddress)")
 
+    # 12m sum + API updated
     payload[PD_ORG_12M_SUM_KEY] = total_12m
     print(f"[SET] 12m sum -> {PD_ORG_12M_SUM_KEY} = {total_12m}")
 
     payload[PD_ORG_API_UPDATED_KEY] = now_iso()
     print(f"[SET] API updated -> {PD_ORG_API_UPDATED_KEY} = {payload[PD_ORG_API_UPDATED_KEY]}")
 
-    # PG nitrile logic (same rule as you described earlier)
+    # Example PG rule (only if nitrile present)
     if nitrile_present:
         payload[PD_PG_NITRILE_SUM_KEY] = nitrile_sum
         print(f"[SET] PG Sum nitrile -> {PD_PG_NITRILE_SUM_KEY} = {nitrile_sum}")
@@ -468,26 +454,42 @@ def build_org_update_payload(
     log("FINAL org update payload", payload)
     return payload
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # ROUTES
-# -----------------------------------------------------------------------------
+# =============================================================================
 @app.get("/health")
 async def health():
-    return {"ok": True, "env": env_status()}
+    # IMPORTANT: do not print actual secret values
+    return {
+        "ok": True,
+        "env": {
+            "PAYTRAQ_BASE_URL": PAYTRAQ_BASE_URL,
+            "PIPEDRIVE_BASE_URL": PIPEDRIVE_BASE_URL,
+            "PAYTRAQ_API_KEY_set": True,
+            "PAYTRAQ_API_TOKEN_set": True,
+            "PIPEDRIVE_API_TOKEN_set": True,
+            "NITRILE_SKUS": NITRILE_SKUS,
+            "NITRILE_KEYWORDS": NITRILE_KEYWORDS,
+            "ts": now_iso(),
+        }
+    }
 
 @app.post("/")
 async def pubsub_push(request: Request):
     """
-    Eventarc->Cloud Run Pub/Sub push handler.
-    Expects: {"message":{"data":"base64(json)"}} where json has document_id and optionally deal_id.
+    Eventarc -> Cloud Run Pub/Sub push.
+    Body example:
+      {"message":{"data":"base64(json)"}}
+    where json includes: {"document_id": 15584268, "deal_id": 0}
     """
     try:
         body = await request.json()
     except Exception:
         body = {}
-    log("INCOMING / body", body)
 
-    payload, dbg_decode = decode_pubsub_payload(body)
+    log("INCOMING POST / body", body)
+
+    payload, dbg_decode = decode_pubsub_message(body)
     log("DECODE debug", dbg_decode)
 
     if not payload:
@@ -499,7 +501,6 @@ async def pubsub_push(request: Request):
     if not doc_id:
         return JSONResponse({"ok": True, "skipped": "no_document_id", "payload": payload, "extract": dbg_extract}, status_code=200)
 
-    # PROCESS
     try:
         result = process_document(doc_id, deal_id, payload)
         return JSONResponse({"ok": True, "result": result}, status_code=200)
@@ -507,13 +508,13 @@ async def pubsub_push(request: Request):
         log("PROCESS FAILED", {"error": str(e), "trace": traceback.format_exc()})
         return JSONResponse({"ok": False, "error": str(e), "trace": traceback.format_exc()}, status_code=500)
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # CORE
-# -----------------------------------------------------------------------------
+# =============================================================================
 def process_document(document_id: int, deal_id: Optional[int], raw_payload: Dict[str, Any]) -> Dict[str, Any]:
     log("PROCESS START", {"document_id": document_id, "deal_id": deal_id, "ts": now_iso(), "raw_payload": raw_payload})
 
-    sale_root, sale_meta = get_sale_xml(document_id)
+    sale_root, sale_meta = get_sale_root_and_meta(document_id)
 
     client_id, dbg_cid = extract_client_id_from_sale(sale_root)
     log("CLIENT_ID extract debug", dbg_cid)
@@ -529,15 +530,12 @@ def process_document(document_id: int, deal_id: Optional[int], raw_payload: Dict
 
     client = get_client(client_id)
 
-    # compute 12m
     sales_rows = list_sales_365d(client_id)
     total_12m = compute_12m_total(sales_rows)
     log("12M computed", {"client_id": client_id, "total_12m": total_12m})
 
-    # detect nitrile (best-effort; refine later)
     nitrile_present, nitrile_sum, nitrile_dbg = detect_nitrile(sale_root)
 
-    # find org
     regno = (client.get("RegNumber") or "").strip()
     email = (client.get("Email") or "").strip()
 
@@ -567,7 +565,7 @@ def process_document(document_id: int, deal_id: Optional[int], raw_payload: Dict
         "pg_nitrile_date": existing_org.get(PD_PG_NITRILE_DATE_KEY),
     })
 
-    payload = build_org_update_payload(
+    update_payload = build_org_update_payload(
         client=client,
         total_12m=total_12m,
         sale_meta=sale_meta,
@@ -576,17 +574,17 @@ def process_document(document_id: int, deal_id: Optional[int], raw_payload: Dict
         nitrile_sum=nitrile_sum,
     )
 
-    if not payload:
+    if not update_payload:
         return {"document_id": document_id, "deal_id": deal_id, "org_id": org_id, "updated": False, "reason": "payload_empty"}
 
-    pd_resp = pd_put(f"organizations/{org_id}", payload)
+    pd_resp = pd_put(f"organizations/{org_id}", update_payload)
 
     result = {
         "document_id": document_id,
         "deal_id": deal_id,
         "org_id": org_id,
         "updated": True,
-        "payload_keys": list(payload.keys()),
+        "payload_keys": list(update_payload.keys()),
         "paytraq": {
             "sale_meta": sale_meta,
             "client_id": client_id,
@@ -598,8 +596,7 @@ def process_document(document_id: int, deal_id: Optional[int], raw_payload: Dict
             "nitrile_sum": nitrile_sum,
             "nitrile_matches": (nitrile_dbg or {}).get("matches", []),
         },
-        "pipedrive_success": bool((pd_resp or {}).get("success", True)),
-        "pipedrive_response_preview": pd_resp,
+        "pipedrive_response": pd_resp,
     }
 
     log("PROCESS DONE", result)
