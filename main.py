@@ -52,8 +52,18 @@ def list_sales_client_365d(client_id: str):
             "page": page,
         }
         r = requests.get(url, params=params, timeout=30)
-        r.raise_for_status()
-        data = r.json()
+        ct = (r.headers.get("content-type") or "").lower()
+        print(f"PAYTRAQ /api/sales -> status={r.status_code} content-type={ct} len={len(r.text)}")
+        if r.status_code != 200:
+            print("PAYTRAQ body(first300):", r.text[:300])
+            r.raise_for_status()
+
+        # PayTraq reizēm atdod ne-JSON (piem., HTML). Tad ielogojam preview.
+        try:
+            data = r.json()
+        except Exception:
+            print("PAYTRAQ non-json body(first300):", r.text[:300])
+            raise
 
         items = None
         if isinstance(data, dict):
