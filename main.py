@@ -1,6 +1,7 @@
 import os
 import base64
 import json
+import time
 from datetime import date, timedelta
 from typing import Any, Dict, List, Optional
 from xml.etree import ElementTree as ET
@@ -15,7 +16,7 @@ from fastapi.responses import JSONResponse
 PAYTRAQ_BASE_URL = os.getenv("PAYTRAQ_BASE_URL", "https://go.paytraq.com").rstrip("/")
 PAYTRAQ_API_KEY = os.getenv("PAYTRAQ_API_KEY")
 PAYTRAQ_API_TOKEN = os.getenv("PAYTRAQ_API_TOKEN")
-PIPEDRIVE_API_TOKEN = os.getenv("PIPEDRIVE_API_TOKEN")  # šajā solī vēl nelietojam
+PIPEDRIVE_API_TOKEN = os.getenv("PIPEDRIVE_API_TOKEN")  # vēl nelietojam šajā solī
 
 app = FastAPI()
 
@@ -43,7 +44,6 @@ def _require_env():
 
 
 def _safe_b64decode(s: str) -> bytes:
-    # Pub/Sub dažreiz atnāk bez padding (=)
     s = (s or "").strip()
     pad = (-len(s)) % 4
     if pad:
@@ -54,14 +54,13 @@ def _safe_b64decode(s: str) -> bytes:
 def _decode_pubsub_push(body: Dict[str, Any]) -> Dict[str, Any]:
     """
     Pieņem:
-    1) Pub/Sub push formātu: {"message":{"data":"base64(json)"}, ...}
+    1) Pub/Sub push: {"message":{"data":"base64(json)"}, ...}
     2) Tiešu JSON payload testam: {"deal_id":..,"document_id":..}
     """
     if not isinstance(body, dict):
         return {}
 
-    # Ja jau ir payload lauki — pieņemam kā tiešo payload
-    if any(k in body for k in ("document_id", "deal_id", "client_id", "date_from", "date_till")):
+    if any(k in body for k in ("document_id", "deal_id", "client_id", "org_id", "date_from", "date_till", "dry_run")):
         return body
 
     msg = (body.get("message") or {}) if isinstance(body.get("message"), dict) else {}
@@ -108,14 +107,12 @@ def fetch_client_id_from_sale(document_id: str) -> Optional[str]:
 
 def list_sales_client_range(client_id: str, d_from: date, d_to: date) -> List[ET.Element]:
     """
-    SVARĪGI:
-    - PayTraq paging tavos strādājošajos skriptos sākas ar page=0, nevis 1.
-    - Tāpēc šeit page=0 (tas bija galvenais bug).
+    SVARĪGI: paging sākas ar page=0
     """
     _require_env()
 
     url = f"{PAYTRAQ_BASE_URL}/api/sales"
-    page = 0  # <<< FIX: bija 1
+    page = 0
     out: List[ET.Element] = []
 
     print(f"PAYTRAQ /api/sales RANGE client_id={client_id} date_from={d_from.isoformat()} date_till={d_to.isoformat()}")
@@ -148,12 +145,9 @@ def list_sales_client_range(client_id: str, d_from: date, d_to: date) -> List[ET
 
         out.extend(sales)
 
-        # PayTraq lapas izmērs nav dokumentēts šeit; tavos skriptos pietika ar "kamēr vēl ir Sale".
-        # Drošības bremze: ja kādreiz iestrēgst, pārtraucam pēc 200 lapām.
         if page >= 200:
             print("WARN: paging safety stop at page=200")
             break
-
         page += 1
 
     print(f"PAYTRAQ /api/sales -> total Sale nodes collected: {len(out)}")
@@ -173,13 +167,11 @@ def compute_total_365d(sales_items: List[ET.Element], only_ale: bool = True) -> 
     total = 0.0
     for sale in sales_items:
         try:
-            # filtrs: tikai ALE, ja vajag
             if only_ale:
                 ref = (sale.findtext(".//Header/Document/DocumentRef") or sale.findtext(".//DocumentRef") or "").strip()
                 if ref and not ref.startswith("ALE"):
                     continue
 
-            # Total var būt dažādos ceļos atkarībā no PayTraq XML
             candidates = [
                 sale.findtext(".//Header/Total"),
                 sale.findtext(".//Header/Document/Total"),
@@ -219,46 +211,39 @@ def extract_refs(sales_items: List[ET.Element], limit: int = 50, only_ale: bool 
     return out
 
 
-@app.post("/")
-async def handle_pubsub(request: Request):
-    body = await request.json()
-
+# ----------------------------
+# STEP RUNNER
+# ----------------------------
+def _run_step(ctx: Dict[str, Any], name: str, fn):
+    t0 = time.time()
     try:
-        payload = _decode_pubsub_push(body)
+        fn(ctx)
+        ms = int((time.time() - t0) * 1000)
+        ctx["_trace"].append({"step": name, "ok": True, "ms": ms})
     except Exception as e:
-        print("ORG-UPDATE decode error:", str(e))
-        print("RAW body:", body)
-        return JSONResponse({"ok": False, "error": "decode_failed"}, status_code=400)
+        ms = int((time.time() - t0) * 1000)
+        ctx["_trace"].append({"step": name, "ok": False, "ms": ms, "error": str(e)})
+        raise
+
+
+def step_01_parse_event(ctx: Dict[str, Any]):
+    body = ctx["body"]
+    payload = _decode_pubsub_push(body)
+    ctx["payload"] = payload
 
     if not payload:
-        print("WARN: no payload; body=", body)
-        return {"ok": True, "skipped": "no_data"}
+        ctx["skipped"] = "no_data"
+        return
 
-    deal_id = payload.get("deal_id")
-    document_id = payload.get("document_id")
-    client_id = payload.get("client_id")
+    ctx["deal_id"] = payload.get("deal_id")
+    ctx["org_id"] = payload.get("org_id")
+    ctx["document_id"] = payload.get("document_id")
+    ctx["client_id"] = payload.get("client_id")
+    ctx["dry_run"] = bool(payload.get("dry_run", False))
 
-    # optional override for testing:
-    date_from_s = payload.get("date_from")  # "YYYY-MM-DD"
-    date_till_s = payload.get("date_till")  # "YYYY-MM-DD"
+    date_from_s = payload.get("date_from")
+    date_till_s = payload.get("date_till")
 
-    print("ORG-UPDATE payload:", payload)
-    print(f"ORG-UPDATE ids: deal_id={deal_id} document_id={document_id} client_id={client_id}")
-
-    if not client_id and document_id:
-        try:
-            client_id = fetch_client_id_from_sale(str(document_id))
-        except Exception as e:
-            print("PAYTRAQ sale fetch error:", str(e))
-            return JSONResponse(
-                {"ok": False, "error": "paytraq_sale_failed", "detail": str(e), "document_id": document_id},
-                status_code=500,
-            )
-
-    if not client_id:
-        return {"ok": True, "skipped": "no_client_id", "payload": payload, "document_id": document_id}
-
-    # default: 450 days (buffer)
     d_to = date.today()
     d_from = d_to - timedelta(days=450)
 
@@ -269,25 +254,83 @@ async def handle_pubsub(request: Request):
             y, m, d = [int(x) for x in str(date_till_s).split("-")]
             d_to = date(y, m, d)
         except Exception:
-            print("WARN: bad date_from/date_till in payload; using default 450d")
+            print("WARN: bad date_from/date_till; using default 450d")
+
+    ctx["date_from"] = d_from
+    ctx["date_till"] = d_to
+
+    print("ORG-UPDATE payload:", payload)
+    print(f"ORG-UPDATE ids: deal_id={ctx['deal_id']} document_id={ctx['document_id']} client_id={ctx['client_id']} org_id={ctx['org_id']}")
+
+
+def step_02_fetch_client_id(ctx: Dict[str, Any]):
+    if ctx.get("skipped"):
+        return
+
+    if not ctx.get("client_id") and ctx.get("document_id"):
+        ctx["client_id"] = fetch_client_id_from_sale(str(ctx["document_id"]))
+
+    if not ctx.get("client_id"):
+        ctx["skipped"] = "no_client_id"
+
+
+def step_03_compute_12m(ctx: Dict[str, Any]):
+    if ctx.get("skipped"):
+        return
+
+    sales = list_sales_client_range(str(ctx["client_id"]), ctx["date_from"], ctx["date_till"])
+    ctx["sales_count"] = len(sales)
+    ctx["total_sum"] = compute_total_365d(sales, only_ale=True)
+    ctx["sample_refs"] = extract_refs(sales, limit=20, only_ale=True)
+
+    print(f"ORG-UPDATE total_sum client_id={ctx['client_id']}: {ctx['total_sum']}")
+
+
+def run_steps(ctx: Dict[str, Any]):
+    _run_step(ctx, "01_parse_event", step_01_parse_event)
+    _run_step(ctx, "02_fetch_client_id", step_02_fetch_client_id)
+    _run_step(ctx, "03_compute_12m", step_03_compute_12m)
+
+
+@app.post("/")
+async def handle_pubsub(request: Request):
+    body = await request.json()
+
+    ctx: Dict[str, Any] = {"body": body, "_trace": []}
 
     try:
-        sales = list_sales_client_range(str(client_id), d_from, d_to)
-        total_sum = compute_total_365d(sales, only_ale=True)
-        refs = extract_refs(sales, limit=20, only_ale=True)
-        print(f"ORG-UPDATE total_sum client_id={client_id}: {total_sum}")
+        run_steps(ctx)
     except Exception as e:
-        print("PAYTRAQ error:", str(e))
-        return JSONResponse({"ok": False, "error": "paytraq_failed", "detail": str(e)}, status_code=500)
+        return JSONResponse(
+            {
+                "ok": False,
+                "error": "step_failed",
+                "detail": str(e),
+                "_trace": ctx["_trace"],
+                "payload": ctx.get("payload"),
+            },
+            status_code=500,
+        )
+
+    if ctx.get("skipped"):
+        return {
+            "ok": True,
+            "skipped": ctx["skipped"],
+            "_trace": ctx["_trace"],
+            "payload": ctx.get("payload"),
+            "document_id": ctx.get("document_id"),
+        }
 
     return {
         "ok": True,
-        "client_id": str(client_id),
-        "document_id": document_id,
-        "deal_id": deal_id,
-        "date_from": d_from.isoformat(),
-        "date_till": d_to.isoformat(),
-        "sales_count": len(sales),
-        "total_sum": total_sum,
-        "sample_refs": refs,
+        "_trace": ctx["_trace"],
+        "client_id": str(ctx["client_id"]),
+        "document_id": ctx.get("document_id"),
+        "deal_id": ctx.get("deal_id"),
+        "org_id": ctx.get("org_id"),
+        "date_from": ctx["date_from"].isoformat(),
+        "date_till": ctx["date_till"].isoformat(),
+        "sales_count": ctx.get("sales_count"),
+        "total_sum": ctx.get("total_sum"),
+        "sample_refs": ctx.get("sample_refs"),
     }
