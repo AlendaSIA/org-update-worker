@@ -108,7 +108,7 @@ def extract_refs(sales_items, limit=20):
     out = []
     for sale in sales_items:
         doc = sale.find(".//Header/Document") or sale.find(".//Document")
-        if doc is None: 
+        if doc is None:
             continue
         d = (doc.findtext("DocumentDate") or "").strip()
         ref = (doc.findtext("DocumentRef") or "").strip()
@@ -134,7 +134,9 @@ def run(body: Dict[str, Any]):
     ctx = {
         "body": body,
         "_trace": [],
-        # helpers
+        "log": print,
+
+        # canonical helpers
         "decode_event_to_payload": decode_event_to_payload,
         "fetch_client_id_from_sale": fetch_client_id_from_sale,
         "list_sales_client_range": list_sales_client_range,
@@ -142,7 +144,12 @@ def run(body: Dict[str, Any]):
         "extract_refs": extract_refs,
         "today": date.today,
         "timedelta": timedelta,
-        "log": print,
+
+        # aliases for your existing step files (so they work)
+        "decode_pubsub": decode_event_to_payload,
+        "paytraq_fetch_client_id": fetch_client_id_from_sale,
+        "paytraq_list_sales": list_sales_client_range,
+        "compute_total": compute_total_12m,
     }
 
     _run_step(ctx, "01_parse_event", step_01_parse_event.run)
