@@ -51,7 +51,6 @@ def _extract_sale_ref(sale_el: ET.Element) -> str:
 
 
 def _extract_sale_id(sale_el: ET.Element) -> Optional[str]:
-    # ļoti toleranti — PayTraq mēdz atšķirties
     for path in (
         ".//Header/Document/DocumentID",
         ".//Document/DocumentID",
@@ -91,7 +90,6 @@ def _fetch_sale_xml(document_id: str) -> ET.Element:
 
 
 def _iter_line_like_nodes(root: ET.Element):
-    # mēģinām vairākas tipiskas struktūras
     for xp in (
         ".//Lines/Line",
         ".//Line",
@@ -115,7 +113,6 @@ def _line_text(node: ET.Element, *names: str) -> str:
 
 
 def _line_amount(node: ET.Element) -> Optional[float]:
-    # ņemam “gross-like” ja ir, citādi fallback
     for nm in (
         "Total",
         "LineTotal",
@@ -131,7 +128,6 @@ def _line_amount(node: ET.Element) -> Optional[float]:
 
 
 def _is_nitrile(node: ET.Element) -> bool:
-    # vienkāršs noteikums (pietiek startam): ja kaut kur ir “nitril”
     hay = " ".join(
         [
             _line_text(node, "ProductName", "Name", "ItemName"),
@@ -169,7 +165,7 @@ def run(ctx: Dict[str, Any]) -> None:
     ctx["total_sum"] = ctx["compute_total"](sales)
     ctx["sample_refs"] = ctx["extract_refs"](sales, limit=20)
 
-    # ---- orders metrics (esošais) ----
+    # ---- orders metrics ----
     dates: List[date] = []
     for s in sales:
         d = _extract_sale_date(s)
@@ -224,7 +220,14 @@ def run(ctx: Dict[str, Any]) -> None:
         }
     }
 
-    # atspoguļojam computed (lai redzēt outputā)
+    # neatkarīgs step_03 “paraksts” (lai Step_04 nepazūd)
+    ctx["step_03"] = {
+        "pg_sum_nitrile": ctx["pg"]["Cimdi nitrila"]["sum"],
+        "pg_date_nitrile": ctx["pg"]["Cimdi nitrila"]["date"],
+        "sales_count": ctx["sales_count"],
+    }
+
+    # computed (var tikt pārrakstīts vēlāk, bet step_03 paliks)
     ctx["computed"] = {
         "sales_count": ctx["sales_count"],
         "total_sum": ctx["total_sum"],
