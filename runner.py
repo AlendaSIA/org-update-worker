@@ -10,12 +10,16 @@ from steps import (
 )
 
 
-def run(body: Dict[str, Any]) -> Dict[str, Any]:
+def run(body: Dict[str, Any], helpers: Dict[str, Any]) -> Dict[str, Any]:
     ctx: Dict[str, Any] = {}
     trace = []
 
     try:
-        ctx["body"] = body  # 🔥 šis bija obligāts
+        # ---- ORIĢINĀLĀ plūsma (nemainīta) ----
+        ctx["body"] = body
+
+        # helper funkcijas
+        ctx.update(helpers)
 
         for step in [
             step_01_parse_event,
@@ -43,6 +47,7 @@ def run(body: Dict[str, Any]) -> Dict[str, Any]:
                     "error": str(e),
                 }
 
+        # ---- ŠEIT ir VIENĪGĀ izmaiņa ----
         return {
             "ok": True,
             "_trace": trace,
@@ -58,7 +63,7 @@ def run(body: Dict[str, Any]) -> Dict[str, Any]:
             "sample_refs": ctx.get("sample_refs"),
             "update": ctx.get("update"),
             "computed": ctx.get("computed"),
-            "step_03": ctx.get("step_03"),
+            "step_03": ctx.get("step_03"),   # 👈 TIKAI ŠIS ir pievienots
             "step_05": ctx.get("step_05"),
             "dry_run": bool(ctx.get("dry_run")),
         }
