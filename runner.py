@@ -10,20 +10,31 @@ PAYTRAQ_API_KEY = os.getenv("PAYTRAQ_API_KEY")
 PAYTRAQ_API_TOKEN = os.getenv("PAYTRAQ_API_TOKEN")
 PIPEDRIVE_API_TOKEN = os.getenv("PIPEDRIVE_API_TOKEN")
 
+
 def health():
+    # Health MUST NOT crash. Never return secrets, only booleans.
     return {
         "ok": True,
         "env": {
             "PAYTRAQ_BASE_URL": PAYTRAQ_BASE_URL,
             "PAYTRAQ_API_KEY_set": bool(PAYTRAQ_API_KEY),
             "PAYTRAQ_API_TOKEN_set": bool(PAYTRAQ_API_TOKEN),
-            "PIPEDRIVE_API_TOKEN_set": bool(PIPEDRIVE_API_API_TOKEN),
+            "PIPEDRIVE_API_TOKEN_set": bool(PIPEDRIVE_API_TOKEN),
         },
     }
 
+
 def _require_env():
-    if not PAYTRAQ_API_KEY or not PAYTRAQ_API_TOKEN:
-        raise RuntimeError("Missing PAYTRAQ env vars")
+    missing = []
+    if not PAYTRAQ_API_KEY:
+        missing.append("PAYTRAQ_API_KEY")
+    if not PAYTRAQ_API_TOKEN:
+        missing.append("PAYTRAQ_API_TOKEN")
+    if not PIPEDRIVE_API_TOKEN:
+        missing.append("PIPEDRIVE_API_TOKEN")
+    if missing:
+        raise RuntimeError("Missing env vars: " + ", ".join(missing))
+
 
 def _safe_b64decode(s: str) -> bytes:
     s = (s or "").strip()
@@ -32,15 +43,19 @@ def _safe_b64decode(s: str) -> bytes:
         s += "=" * pad
     return base64.b64decode(s)
 
+
 def decode_event_to_payload(body: Dict[str, Any]) -> Dict[str, Any]:
-    if any(k in body for k in ("document_id","deal_id","client_id","org_id","date_from","date_till","dry_run")):
+    # allow direct payload testing
+    if any(k in body for k in ("document_id", "deal_id", "client_id", "org_id", "date_from", "date_till", "dry_run")):
         return body
+
     msg = body.get("message") or {}
     data_b64 = (msg.get("data") if isinstance(msg, dict) else None)
     if not data_b64:
         return {}
     raw = _safe_b64decode(str(data_b64)).decode("utf-8", errors="replace")
     return json.loads(raw)
+
 
 def fetch_client_id_from_sale(document_id: str) -> str:
     _require_env()
@@ -56,6 +71,7 @@ def fetch_client_id_from_sale(document_id: str) -> str:
     if node is not None and node.text and node.text.strip():
         return node.text.strip()
     raise RuntimeError("ClientID not found in sale XML")
+
 
 def list_sales_client_range(client_id: str, d_from: date, d_to: date):
     _require_env()
@@ -86,10 +102,15 @@ def list_sales_client_range(client_id: str, d_from: date, d_to: date):
             break
     return out
 
+
 def _parse_float(t):
-    if not t: return None
-    try: return float(str(t).strip().replace(",", "."))
-    except: return None
+    if not t:
+        return None
+    try:
+        return float(str(t).strip().replace(",", "."))
+    except Exception:
+        return None
+
 
 def compute_total_12m(sales_items):
     total = 0.0
@@ -103,6 +124,7 @@ def compute_total_12m(sales_items):
                 total += v
                 break
     return round(total, 2)
+
 
 def extract_refs(sales_items, limit=20):
     out = []
@@ -119,18 +141,18 @@ def extract_refs(sales_items, limit=20):
             break
     return out
 
+
 def _run_step(ctx, name, fn):
     t0 = time.time()
     try:
         fn(ctx)
-        ctx["_trace"].append({"step": name, "ok": True, "ms": int((time.time()-t0)*1000)})
+        ctx["_trace"].append({"step": name, "ok": True, "ms": int((time.time() - t0) * 1000)})
     except Exception as e:
-        ctx["_trace"].append({"step": name, "ok": False, "ms": int((time.time()-t0)*1000), "error": str(e)})
+        ctx["_trace"].append({"step": name, "ok": False, "ms": int((time.time() - t0) * 1000), "error": str(e)})
         raise
 
+
 def _discover_steps() -> List[str]:
-    # manually list to keep it simple and predictable
-    # later we can auto-discover via pkgutil if you want
     return [
         "steps.step_01_parse_event",
         "steps.step_02_fetch_client_id",
@@ -138,6 +160,7 @@ def _discover_steps() -> List[str]:
         "steps.step_04_build_update",
         "steps.step_05_update_org",
     ]
+
 
 def run(body: Dict[str, Any]):
     ctx = {
@@ -153,6 +176,7 @@ def run(body: Dict[str, Any]):
         "today": date.today,
         "timedelta": timedelta,
 
+        # aliases (compat)
         "decode_pubsub": decode_event_to_payload,
         "paytraq_fetch_client_id": fetch_client_id_from_sale,
         "paytraq_list_sales": list_sales_client_range,
