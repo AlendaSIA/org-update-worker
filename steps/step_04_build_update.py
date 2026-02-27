@@ -45,16 +45,14 @@ def run(ctx: Dict[str, Any]) -> None:
         sum_value = pg_data.get("sum")
         date_value = pg_data.get("date")
 
-        # Field names = stabila identitāte registry
         field_sum_name = f"PG Sum {pg_name}"
         field_date_name = f"PG Date {pg_name}"
 
-        # Key resolve/create
         key_pg_sum = get_or_create_org_field_key(field_sum_name, "double")
         key_pg_date = get_or_create_org_field_key(field_date_name, "date")
 
-        # Rakstām tikai ja ir vērtība
-        if sum_value is not None:
+        # ✅ LABOJUMS — tikai ja > 0
+        if sum_value is not None and float(sum_value) > 0:
             update[key_pg_sum] = float(sum_value)
 
         if date_value:
