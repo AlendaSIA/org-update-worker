@@ -55,6 +55,20 @@ def _extract_sale_id(sale_el: ET.Element) -> Optional[str]:
     return None
 
 
+def _extract_doc_ref(sale_el: ET.Element) -> str:
+    return (
+        (sale_el.findtext(".//Header/Document/DocumentRef") or "")
+        or (sale_el.findtext(".//Document/DocumentRef") or "")
+        or (sale_el.findtext(".//DocumentRef") or "")
+    ).strip()
+
+
+def _is_ale_sale(sale_el: ET.Element) -> bool:
+    # Biznesa noteikums: reālie pārdošanas dokumenti ir tie, kuru DocumentRef sākas ar "ALE"
+    ref = _extract_doc_ref(sale_el)
+    return ref.upper().startswith("ALE")
+
+
 def _parse_float(t: Any) -> Optional[float]:
     if t is None:
         return None
@@ -163,7 +177,10 @@ def run(ctx: Dict[str, Any]) -> None:
     if ctx.get("skipped"):
         return
 
-    sales = ctx["paytraq_list_sales"](str(ctx["client_id"]), ctx["date_from"], ctx["date_till"])
+    sales_all = ctx["paytraq_list_sales"](str(ctx["client_id"]), ctx["date_from"], ctx["date_till"])
+
+    # ✅ FILTRS: tikai ALE dokumenti tiek ņemti 12m un PG aprēķinos
+    sales = [s for s in sales_all if _is_ale_sale(s)]
 
     ctx["sales_count"] = len(sales)
     ctx["total_sum"] = ctx["compute_total"](sales)
@@ -182,7 +199,6 @@ def run(ctx: Dict[str, Any]) -> None:
     ctx["avg_days_between_last_orders"] = metrics["avg_days_between_last_orders"]
 
     # ---- PG all groups (12m) ----
-    # group_key: (group_id, group_name) -> {sum, last_date}
     groups: Dict[Tuple[str, str], Dict[str, Any]] = {}
     product_group_cache: Dict[str, Optional[Tuple[str, str]]] = {}
 
@@ -225,7 +241,6 @@ def run(ctx: Dict[str, Any]) -> None:
             if sale_date and (groups[key]["last_date"] is None or sale_date > groups[key]["last_date"]):
                 groups[key]["last_date"] = sale_date
 
-    # ctx["pg"] by GroupName (jo Step_04 taisa laukus pēc nosaukuma)
     pg_out: Dict[str, Dict[str, Any]] = {}
     for (_gid, gname), info in groups.items():
         pg_out[gname] = {
@@ -235,11 +250,13 @@ def run(ctx: Dict[str, Any]) -> None:
 
     ctx["pg"] = pg_out
 
-    # step_03 signature + quick debug counts
     ctx["step_03"] = {
         "groups_count": len(pg_out),
         "products_lookups": len(product_group_cache),
         "sales_count": ctx["sales_count"],
+        # debug: cik listā bija vispār un cik palika pēc ALE filtra
+        "sales_count_all": len(sales_all),
+        "sales_count_ale": len(sales),
     }
 
     ctx["computed"] = {
