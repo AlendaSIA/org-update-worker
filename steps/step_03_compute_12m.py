@@ -1,14 +1,9 @@
 from typing import Any, Dict, List, Optional
 from datetime import datetime, date
+from xml.etree import ElementTree as ET
+
 
 def _to_date(v: Any) -> Optional[date]:
-    """
-    Convert various date representations to datetime.date.
-    Accepts:
-      - "YYYY-MM-DD"
-      - ISO strings "YYYY-MM-DDTHH:MM:SS" (optionally with trailing Z)
-      - datetime/date objects
-    """
     if v is None:
         return None
     if isinstance(v, date) and not isinstance(v, datetime):
@@ -19,14 +14,11 @@ def _to_date(v: Any) -> Optional[date]:
         s = v.strip()
         if not s:
             return None
-        # normalize Z
         s = s.replace("Z", "")
-        # try isoformat first
         try:
             return datetime.fromisoformat(s).date()
         except Exception:
             pass
-        # try YYYY-MM-DD fallback
         try:
             return datetime.strptime(s[:10], "%Y-%m-%d").date()
         except Exception:
@@ -36,26 +28,31 @@ def _to_date(v: Any) -> Optional[date]:
 
 def _extract_sale_date(sale: Any) -> Optional[date]:
     """
-    Best-effort extraction of document date from a PayTraq sale item.
-    Since exact schema isn't provided, we try common keys.
+    PayTraq sales items in this project are ET.Element (<Sale>).
+    Extract DocumentDate from common paths.
     """
+    # ET.Element case (the important one)
+    if isinstance(sale, ET.Element):
+        # Prefer header path, fallback to direct
+        txt = (
+            sale.findtext(".//Header/Document/DocumentDate")
+            or sale.findtext(".//Document/DocumentDate")
+            or sale.findtext(".//DocumentDate")
+            or ""
+        ).strip()
+        d = _to_date(txt)
+        if d:
+            return d
+        return None
+
+    # dict fallback (in case you ever change source later)
     if isinstance(sale, dict):
-        # Common candidates (add/adjust once we see actual payload)
-        for k in (
-            "DocumentDate",
-            "document_date",
-            "date",
-            "Date",
-            "SaleDate",
-            "sale_date",
-        ):
+        for k in ("DocumentDate", "document_date", "date", "Date", "SaleDate", "sale_date"):
             if k in sale:
                 d = _to_date(sale.get(k))
                 if d:
                     return d
 
-        # Sometimes nested structures exist
-        # e.g. {"Header":{"Document":{"DocumentDate":"..."}}}
         header = sale.get("Header") or sale.get("header")
         if isinstance(header, dict):
             doc = header.get("Document") or header.get("document")
@@ -64,7 +61,6 @@ def _extract_sale_date(sale: Any) -> Optional[date]:
                 if d:
                     return d
 
-    # If sale isn't dict or no date found
     return None
 
 
@@ -91,7 +87,6 @@ def _compute_order_metrics_from_sales(sales: List[Any]) -> Dict[str, Any]:
         avg_days = 1
     else:
         diffs = [(last4[i] - last4[i - 1]).days for i in range(1, len(last4))]
-        # defensive: avoid division by zero though it shouldn't happen
         avg_days = round(sum(diffs) / max(len(diffs), 1), 2)
 
     return {
