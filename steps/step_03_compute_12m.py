@@ -3,6 +3,7 @@ from datetime import datetime, date
 from xml.etree import ElementTree as ET
 import os
 import requests
+import re
 
 PAYTRAQ_BASE_URL = os.getenv("PAYTRAQ_BASE_URL", "https://go.paytraq.com").rstrip("/")
 PAYTRAQ_API_KEY = os.getenv("PAYTRAQ_API_KEY")
@@ -129,18 +130,81 @@ def _iter_line_like_nodes(root: ET.Element):
                 yield n
 
 
-def _line_amount(node: ET.Element) -> Optional[float]:
-    # prefer totals if present
+def _extract_include_tax(root: ET.Element) -> bool:
+    v = (
+        root.findtext(".//Header/IncludeTax")
+        or root.findtext(".//IncludeTax")
+        or ""
+    ).strip().lower()
+    return v in ("true", "1", "yes")
+
+
+def _vat_rate_from_text(s: str) -> Optional[float]:
+    if not s:
+        return None
+    m = re.search(r"(\d{1,2})(?:[.,](\d{1,2}))?\s*%", s)
+    if not m:
+        return None
+    whole = m.group(1)
+    frac = m.group(2)
+    try:
+        if frac:
+            pct = float(f"{whole}.{frac}")
+        else:
+            pct = float(whole)
+        return pct / 100.0
+    except Exception:
+        return None
+
+
+def _extract_line_vat_rate(line_node: ET.Element, full_root: ET.Element) -> Optional[float]:
+    # 1) mēģinam no līnijas TaxKeyName, piem. "PVN 21%"
+    for xp in ("TaxKey/TaxKeyName", "TaxKeyName", "VAT", "Vat", "Tax"):
+        txt = (line_node.findtext(xp) or "").strip()
+        r = _vat_rate_from_text(txt)
+        if r is not None:
+            return r
+
+    # 2) fallback no dokumenta Taxes/Tax/TaxKeyName
+    for tax in full_root.findall(".//Taxes/Tax"):
+        txt = (tax.findtext(".//TaxKey/TaxKeyName") or tax.findtext("TaxKeyName") or "").strip()
+        r = _vat_rate_from_text(txt)
+        if r is not None:
+            return r
+
+    return None
+
+
+def _line_amount_gross(line_node: ET.Element) -> Optional[float]:
+    # prefer totals if present (šobrīd bieži ir gross, ja IncludeTax=true)
     for nm in ("Total", "LineTotal", "Sum", "TotalWithTax", "Amount", "RowTotal"):
-        v = _parse_float(node.findtext(nm))
+        v = _parse_float(line_node.findtext(nm))
         if v is not None:
             return v
     # fallback qty*price
-    qty = _parse_float(node.findtext("Qty") or node.findtext("Quantity"))
-    price = _parse_float(node.findtext("Price") or node.findtext("UnitPrice"))
+    qty = _parse_float(line_node.findtext("Qty") or line_node.findtext("Quantity"))
+    price = _parse_float(line_node.findtext("Price") or line_node.findtext("UnitPrice"))
     if qty is not None and price is not None:
         return float(qty) * float(price)
     return None
+
+
+def _line_amount_net(line_node: ET.Element, full_root: ET.Element) -> Optional[float]:
+    gross = _line_amount_gross(line_node)
+    if gross is None:
+        return None
+
+    include_tax = _extract_include_tax(full_root)
+    if not include_tax:
+        # ja PayTraq saka, ka nodoklis nav iekļauts cenā, tad pieņemam, ka šī summa jau ir NET
+        return float(gross)
+
+    vat = _extract_line_vat_rate(line_node, full_root)
+    if vat is None:
+        # nevaram droši izrēķināt net -> atgriežam gross, lai neizdomātu
+        return float(gross)
+
+    return float(gross) / (1.0 + float(vat))
 
 
 def _line_item_id(node: ET.Element) -> Optional[str]:
@@ -149,6 +213,15 @@ def _line_item_id(node: ET.Element) -> Optional[str]:
         t = (node.findtext(nm) or "").strip()
         if t:
             return t
+    return None
+
+
+def _sale_net_total(full_root: ET.Element) -> Optional[float]:
+    # Prefer Totals/NetAmount (tas ir tieši NET bez PVN)
+    for xp in (".//Totals/NetAmount", ".//NetAmount"):
+        v = _parse_float(full_root.findtext(xp))
+        if v is not None:
+            return float(v)
     return None
 
 
@@ -183,7 +256,6 @@ def run(ctx: Dict[str, Any]) -> None:
     sales = [s for s in sales_all if _is_ale_sale(s)]
 
     ctx["sales_count"] = len(sales)
-    ctx["total_sum"] = ctx["compute_total"](sales)
     ctx["sample_refs"] = ctx["extract_refs"](sales, limit=20)
 
     # ---- orders metrics ----
@@ -198,9 +270,11 @@ def run(ctx: Dict[str, Any]) -> None:
     ctx["last_order_date"] = metrics["last_order_date"]
     ctx["avg_days_between_last_orders"] = metrics["avg_days_between_last_orders"]
 
-    # ---- PG all groups (12m) ----
+    # ---- PG all groups (12m) + TOTAL NET (12m) ----
     groups: Dict[Tuple[str, str], Dict[str, Any]] = {}
     product_group_cache: Dict[str, Optional[Tuple[str, str]]] = {}
+
+    total_net_sum = 0.0
 
     for sale_el in sales:
         doc_id = _extract_sale_id(sale_el)
@@ -213,6 +287,11 @@ def run(ctx: Dict[str, Any]) -> None:
             full = _fetch_sale_xml(str(doc_id))
         except Exception:
             continue
+
+        # ✅ TOTAL NET: summējam NetAmount no pilnā XML
+        net_total = _sale_net_total(full)
+        if net_total is not None:
+            total_net_sum += float(net_total)
 
         for ln in _iter_line_like_nodes(full):
             item_id = _line_item_id(ln)
@@ -229,7 +308,8 @@ def run(ctx: Dict[str, Any]) -> None:
             if not ginfo:
                 continue
 
-            amt = _line_amount(ln)
+            # ✅ PG NET: rindu summas bez PVN
+            amt = _line_amount_net(ln, full)
             if amt is None:
                 continue
 
@@ -240,6 +320,9 @@ def run(ctx: Dict[str, Any]) -> None:
             groups[key]["sum"] += float(amt)
             if sale_date and (groups[key]["last_date"] is None or sale_date > groups[key]["last_date"]):
                 groups[key]["last_date"] = sale_date
+
+    # ✅ total_sum tagad ir NET (bez PVN)
+    ctx["total_sum"] = round(float(total_net_sum), 2)
 
     pg_out: Dict[str, Dict[str, Any]] = {}
     for (_gid, gname), info in groups.items():
