@@ -10,12 +10,12 @@ from steps import (
 )
 
 
-def run(payload: Dict[str, Any]) -> Dict[str, Any]:
+def run(body: Dict[str, Any]) -> Dict[str, Any]:
     ctx: Dict[str, Any] = {}
     trace = []
 
     try:
-        ctx["payload"] = payload
+        ctx["body"] = body  # 🔥 šis bija obligāts
 
         for step in [
             step_01_parse_event,
@@ -46,7 +46,7 @@ def run(payload: Dict[str, Any]) -> Dict[str, Any]:
         return {
             "ok": True,
             "_trace": trace,
-            "payload": payload,
+            "payload": body,
             "document_id": ctx.get("document_id"),
             "deal_id": ctx.get("deal_id"),
             "org_id": ctx.get("org_id"),
@@ -58,7 +58,7 @@ def run(payload: Dict[str, Any]) -> Dict[str, Any]:
             "sample_refs": ctx.get("sample_refs"),
             "update": ctx.get("update"),
             "computed": ctx.get("computed"),
-            "step_03": ctx.get("step_03"),  # 👈 tagad redzēsim Step_03 rezultātu
+            "step_03": ctx.get("step_03"),
             "step_05": ctx.get("step_05"),
             "dry_run": bool(ctx.get("dry_run")),
         }
