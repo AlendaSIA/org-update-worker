@@ -1,4 +1,4 @@
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from datetime import datetime, date
 from xml.etree import ElementTree as ET
 import os
@@ -41,15 +41,6 @@ def _extract_sale_date(sale_el: ET.Element) -> Optional[date]:
     return _to_date(txt)
 
 
-def _extract_sale_ref(sale_el: ET.Element) -> str:
-    return (
-        sale_el.findtext(".//Header/Document/DocumentRef")
-        or sale_el.findtext(".//Document/DocumentRef")
-        or sale_el.findtext(".//DocumentRef")
-        or ""
-    ).strip()
-
-
 def _extract_sale_id(sale_el: ET.Element) -> Optional[str]:
     for path in (
         ".//Header/Document/DocumentID",
@@ -79,6 +70,7 @@ def _parse_float(t: Any) -> Optional[float]:
 def _fetch_sale_xml(document_id: str) -> ET.Element:
     if not PAYTRAQ_API_KEY or not PAYTRAQ_API_TOKEN:
         raise RuntimeError("Missing PAYTRAQ_API_KEY / PAYTRAQ_API_TOKEN env")
+
     r = requests.get(
         f"{PAYTRAQ_BASE_URL}/api/sale/{document_id}",
         params={"APIKey": PAYTRAQ_API_KEY, "APIToken": PAYTRAQ_API_TOKEN},
@@ -89,53 +81,61 @@ def _fetch_sale_xml(document_id: str) -> ET.Element:
     return ET.fromstring(r.text)
 
 
+def _fetch_product_group(item_id: str) -> Optional[Tuple[str, str]]:
+    """Returns (group_id, group_name)"""
+    if not PAYTRAQ_API_KEY or not PAYTRAQ_API_TOKEN:
+        raise RuntimeError("Missing PAYTRAQ_API_KEY / PAYTRAQ_API_TOKEN env")
+
+    r = requests.get(
+        f"{PAYTRAQ_BASE_URL}/api/product/{item_id}",
+        params={"APIKey": PAYTRAQ_API_KEY, "APIToken": PAYTRAQ_API_TOKEN},
+        timeout=30,
+    )
+    if r.status_code != 200:
+        return None
+
+    root = ET.fromstring(r.text)
+    g = root.find("Group")
+    if g is None:
+        return None
+
+    gid = (g.findtext("GroupID") or "").strip()
+    gname = (g.findtext("GroupName") or "").strip()
+    if not gid or not gname:
+        return None
+
+    return gid, gname
+
+
 def _iter_line_like_nodes(root: ET.Element):
-    for xp in (
-        ".//Lines/Line",
-        ".//Line",
-        ".//SaleLine",
-        ".//LineItem",
-        ".//Items/Item",
-        ".//Rows/Row",
-    ):
+    for xp in (".//LineItem", ".//Lines/Line", ".//Line", ".//SaleLine", ".//Items/Item", ".//Rows/Row"):
         nodes = root.findall(xp)
         if nodes:
             for n in nodes:
                 yield n
 
 
-def _line_text(node: ET.Element, *names: str) -> str:
-    for nm in names:
-        t = node.findtext(nm)
-        if t and t.strip():
-            return t.strip()
-    return ""
-
-
 def _line_amount(node: ET.Element) -> Optional[float]:
-    for nm in (
-        "Total",
-        "LineTotal",
-        "Sum",
-        "TotalWithTax",
-        "Amount",
-        "RowTotal",
-    ):
+    # prefer totals if present
+    for nm in ("Total", "LineTotal", "Sum", "TotalWithTax", "Amount", "RowTotal"):
         v = _parse_float(node.findtext(nm))
         if v is not None:
             return v
+    # fallback qty*price
+    qty = _parse_float(node.findtext("Qty") or node.findtext("Quantity"))
+    price = _parse_float(node.findtext("Price") or node.findtext("UnitPrice"))
+    if qty is not None and price is not None:
+        return float(qty) * float(price)
     return None
 
 
-def _is_nitrile(node: ET.Element) -> bool:
-    hay = " ".join(
-        [
-            _line_text(node, "ProductName", "Name", "ItemName"),
-            _line_text(node, "ProductGroup", "Group", "GroupName", "ProductGroupName"),
-            _line_text(node, "ProductCode", "Code", "ItemCode"),
-        ]
-    ).lower()
-    return "nitril" in hay
+def _line_item_id(node: ET.Element) -> Optional[str]:
+    # tolerant paths (lokālajā skriptā bija Item/ItemID)
+    for nm in ("Item/ItemID", "ItemID", "ProductID", "Product/ID", "Item/ID"):
+        t = (node.findtext(nm) or "").strip()
+        if t:
+            return t
+    return None
 
 
 def _compute_order_metrics_from_dates(dates: List[date]) -> Dict[str, Any]:
@@ -152,7 +152,11 @@ def _compute_order_metrics_from_dates(dates: List[date]) -> Dict[str, Any]:
         diffs = [(last4[i] - last4[i - 1]).days for i in range(1, len(last4))]
         avg_days = round(sum(diffs) / max(len(diffs), 1), 2)
 
-    return {"orders_count_12m": len(dates), "last_order_date": last_order_date, "avg_days_between_last_orders": avg_days}
+    return {
+        "orders_count_12m": len(dates),
+        "last_order_date": last_order_date,
+        "avg_days_between_last_orders": avg_days,
+    }
 
 
 def run(ctx: Dict[str, Any]) -> None:
@@ -177,57 +181,67 @@ def run(ctx: Dict[str, Any]) -> None:
     ctx["last_order_date"] = metrics["last_order_date"]
     ctx["avg_days_between_last_orders"] = metrics["avg_days_between_last_orders"]
 
-    # ---- PG 12m (start: tikai “Cimdi nitrila”) ----
-    pg_sum_nitrile = 0.0
-    pg_last_date: Optional[date] = None
+    # ---- PG all groups (12m) ----
+    # group_key: (group_id, group_name) -> {sum, last_date}
+    groups: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    product_group_cache: Dict[str, Optional[Tuple[str, str]]] = {}
 
     for sale_el in sales:
-        ref = _extract_sale_ref(sale_el)
-        if ref and not ref.startswith("ALE"):
-            continue
-
         doc_id = _extract_sale_id(sale_el)
         if not doc_id:
             continue
 
         sale_date = _extract_sale_date(sale_el)
+
         try:
             full = _fetch_sale_xml(str(doc_id))
         except Exception:
             continue
 
-        sale_has_nitrile = False
-        sale_nitrile_sum = 0.0
-
         for ln in _iter_line_like_nodes(full):
-            if not _is_nitrile(ln):
+            item_id = _line_item_id(ln)
+            if not item_id:
                 continue
+
+            if item_id not in product_group_cache:
+                try:
+                    product_group_cache[item_id] = _fetch_product_group(item_id)
+                except Exception:
+                    product_group_cache[item_id] = None
+
+            ginfo = product_group_cache.get(item_id)
+            if not ginfo:
+                continue
+
             amt = _line_amount(ln)
             if amt is None:
                 continue
-            sale_has_nitrile = True
-            sale_nitrile_sum += float(amt)
 
-        if sale_has_nitrile and sale_nitrile_sum > 0:
-            pg_sum_nitrile += sale_nitrile_sum
-            if sale_date and (pg_last_date is None or sale_date > pg_last_date):
-                pg_last_date = sale_date
+            key = (ginfo[0], ginfo[1])
+            if key not in groups:
+                groups[key] = {"sum": 0.0, "last_date": None}
 
-    ctx["pg"] = {
-        "Cimdi nitrila": {
-            "sum": round(pg_sum_nitrile, 2),
-            "date": (pg_last_date.isoformat() if pg_last_date else None),
+            groups[key]["sum"] += float(amt)
+            if sale_date and (groups[key]["last_date"] is None or sale_date > groups[key]["last_date"]):
+                groups[key]["last_date"] = sale_date
+
+    # ctx["pg"] by GroupName (jo Step_04 taisa laukus pēc nosaukuma)
+    pg_out: Dict[str, Dict[str, Any]] = {}
+    for (_gid, gname), info in groups.items():
+        pg_out[gname] = {
+            "sum": round(float(info["sum"]), 2),
+            "date": (info["last_date"].isoformat() if info["last_date"] else None),
         }
-    }
 
-    # neatkarīgs step_03 “paraksts” (lai Step_04 nepazūd)
+    ctx["pg"] = pg_out
+
+    # step_03 signature + quick debug counts
     ctx["step_03"] = {
-        "pg_sum_nitrile": ctx["pg"]["Cimdi nitrila"]["sum"],
-        "pg_date_nitrile": ctx["pg"]["Cimdi nitrila"]["date"],
+        "groups_count": len(pg_out),
+        "products_lookups": len(product_group_cache),
         "sales_count": ctx["sales_count"],
     }
 
-    # computed (var tikt pārrakstīts vēlāk, bet step_03 paliks)
     ctx["computed"] = {
         "sales_count": ctx["sales_count"],
         "total_sum": ctx["total_sum"],
