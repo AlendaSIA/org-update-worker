@@ -190,6 +190,13 @@ def run(body: Dict[str, Any]):
     if ctx.get("skipped"):
         return {"ok": True, "skipped": ctx["skipped"], "_trace": ctx["_trace"], "payload": ctx.get("payload")}
 
+    # ✅ FIX: include computed metrics in response (safe; does not write to Pipedrive)
+    computed = ctx.get("computed") or {
+        "orders_count_12m": ctx.get("orders_count_12m"),
+        "last_order_date": ctx.get("last_order_date"),
+        "avg_days_between_last_orders": ctx.get("avg_days_between_last_orders"),
+    }
+
     return {
         "ok": True,
         "_trace": ctx["_trace"],
@@ -204,6 +211,7 @@ def run(body: Dict[str, Any]):
         "total_sum": ctx.get("total_sum"),
         "sample_refs": ctx.get("sample_refs"),
         "update": ctx.get("update"),
+        "computed": computed,  # <— NEW in response
         "step_05": ctx.get("step_05"),
         "dry_run": bool(ctx.get("dry_run")),
     }
