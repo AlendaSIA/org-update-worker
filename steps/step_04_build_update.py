@@ -48,7 +48,8 @@ def run(ctx: Dict[str, Any]) -> None:
         field_sum_name = f"PG Sum {pg_name}"
         field_date_name = f"PG Date {pg_name}"
 
-        key_pg_sum = get_or_create_org_field_key(field_sum_name, "double")
+        # ✅ IZMAIŅA: lai PG Sum būtu € lauks (monetary), nevis double
+        key_pg_sum = get_or_create_org_field_key(field_sum_name, "monetary")
         key_pg_date = get_or_create_org_field_key(field_date_name, "date")
 
         # ✅ LABOJUMS — tikai ja > 0
