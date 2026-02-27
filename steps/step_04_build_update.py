@@ -22,7 +22,7 @@ def run(ctx: Dict[str, Any]) -> None:
         PIPEDRIVE_ORG_FIELD_12M_SUM: total_sum
     }
 
-    # Resolve/create keys
+    # ===== 12M FIELDS =====
     key_avg_days = get_or_create_org_field_key(FIELD_AVG_DAYS, "double")
     key_orders_12m = get_or_create_org_field_key(FIELD_ORDERS_12M, "double")
     key_last_order_date = get_or_create_org_field_key(FIELD_LAST_ORDER_DATE, "date")
@@ -36,9 +36,34 @@ def run(ctx: Dict[str, Any]) -> None:
     if ctx.get("last_order_date"):
         update[key_last_order_date] = str(ctx["last_order_date"])
 
+
+    # ===== PG DYNAMIC FIELDS =====
+    pg = ctx.get("pg") or {}
+
+    for pg_name, pg_data in pg.items():
+
+        sum_value = pg_data.get("sum")
+        date_value = pg_data.get("date")
+
+        # Field names = stabila identitāte registry
+        field_sum_name = f"PG Sum {pg_name}"
+        field_date_name = f"PG Date {pg_name}"
+
+        # Key resolve/create
+        key_pg_sum = get_or_create_org_field_key(field_sum_name, "double")
+        key_pg_date = get_or_create_org_field_key(field_date_name, "date")
+
+        # Rakstām tikai ja ir vērtība
+        if sum_value is not None:
+            update[key_pg_sum] = float(sum_value)
+
+        if date_value:
+            update[key_pg_date] = str(date_value)
+
+
     ctx["update"] = update
 
-    # 🔥 LABOJUMS: nepārrakstām computed, bet papildinām
+    # ===== Nepārrakstām computed =====
     existing = ctx.get("computed", {})
 
     existing.update({
@@ -47,6 +72,7 @@ def run(ctx: Dict[str, Any]) -> None:
         "orders_count_12m": ctx.get("orders_count_12m"),
         "last_order_date": ctx.get("last_order_date"),
         "avg_days_between_last_orders": ctx.get("avg_days_between_last_orders"),
+        "pg": pg
     })
 
     ctx["computed"] = existing
